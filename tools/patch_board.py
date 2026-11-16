@@ -58,8 +58,12 @@ def patch_cmake() -> None:
         print("[patch] ⚠️ CMakeLists 中未找到 if(CONFIG_BOARD_TYPE_...) 映射链，需手工添加:")
         print(f'    if({KCONFIG_NAME})\n        set(BOARD_TYPE "{BOARD_DIR}")')
         return
-    branch = f'if(CONFIG_{KCONFIG_NAME})\n    set(BOARD_TYPE "{BOARD_DIR}")\n'
-    new_text = text[: m.start()] + branch + text[m.start():]
+    # 将链首 if(CONFIG_BOARD_TYPE_XXX) 替换为: 本板 if + set + elseif(原条件)，
+    # 保持 if/elseif/.../endif 嵌套结构完整
+    branch = (f'if(CONFIG_{KCONFIG_NAME})\n'
+              f'    set(BOARD_TYPE "{BOARD_DIR}")\n'
+              + m.group(0).replace("if(", "elseif(", 1))
+    new_text = text[: m.start()] + branch + text[m.end():]
     cmake.write_text(new_text, encoding="utf-8")
     print(f'[patch] CMakeLists 已插入映射: {KCONFIG_NAME} -> {BOARD_DIR}')
 
