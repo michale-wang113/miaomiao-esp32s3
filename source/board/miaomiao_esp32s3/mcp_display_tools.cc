@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include <esp_log.h>
+
 #include "mcp_server.h"
 #include "board.h"
 #include "display.h"

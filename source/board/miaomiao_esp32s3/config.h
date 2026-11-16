@@ -11,6 +11,7 @@
 #define _BOARD_CONFIG_H_
 
 #include <driver/gpio.h>
+#include <esp_codec_dev_defaults.h>   // ES8311_CODEC_DEFAULT_ADDR（本头文件需自包含）
 
 // -----------------------------------------------------------------------------
 // 音频：ES8311 I2S 编解码器

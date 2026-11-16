@@ -12,7 +12,10 @@
 //    "现在头转到多少度了"          → self.servo.get()
 // =============================================================================
 
+#include <cstdio>
 #include <string>
+
+#include <esp_log.h>
 
 #include "mcp_server.h"
 #include "servo_controller.h"
@@ -124,7 +127,8 @@ void RegisterServoTools() {
             } else {
                 ok = servo.SetContinuous(index, cont);
             }
-            return ok ? true : std::string("切换失败");
+            if (!ok) return std::string("切换失败");
+            return true;
         });
 
     // -------------------------------------------------------------------------

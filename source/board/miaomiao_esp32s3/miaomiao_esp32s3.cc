@@ -3,31 +3,35 @@
 //
 //  依据固件二进制逆向还原（vendor 源码未公开，本文件为净室重写）：
 //   - xiaozhi v2.2.2 / IDF v5.5.4
-//   - 引脚全部经 JTAG GPIO 矩阵实测（见 config.h 与 引脚反推工作表.html）
+//   - 引脚全部经 JTAG GPIO 矩阵实测（见 config.h）
 //   - 硬件：ESP32-S3-WROOM-1-N16R8 / ES8311 codec / GC9A01 双圆屏(并联) /
 //           OV3660 DVP 摄像头 / SG90 舵机×2 / 双按键 / 电池 ADC
 //
 //  相比原厂固件新增（本目录 mcp_servo_tools.cc + mcp_display_tools.cc）：
-//   - self.servo.set / self.servo.action / self.servo.get   → 语音控舵机角度+时长
-//   - self.display.emotion / self.display.emotions          → 语音控表情
+//   - self.servo.set / action / drive / mode / get → 语音控舵机
+//   - self.display.emotion / emotions              → 语音控表情
 //
-//  [编译核对] 标记处为对 xiaozhi v2.2.2 API 语义的还原，编译报错时优先核对这些行
-//  （不同小版本接口签名可能有差异），改动仅需 1-2 行。
+//  显示/相机初始化写法对照官方板型：
+//   - movecall-moji-esp32s3（GC9A01 圆屏 + ES8311）
+//   - bread-compact-wifi-s3cam（DVP 摄像头）
 // =============================================================================
 
-#include <wifi_station.h>
 #include <esp_log.h>
+#include <esp_mac.h>
+#include <cstdio>
 #include <driver/i2c_master.h>
+#include <driver/spi_master.h>
 #include <esp_adc/adc_oneshot.h>
+#include <esp_lcd_panel_io.h>
+#include <esp_lcd_panel_ops.h>
+#include <esp_lcd_gc9a01.h>
 
 #include "wifi_board.h"
-#include "audio_codecs/es8311_audio_codec.h"
-#include "display.h"
-#include "lcd_display.h"
+#include "codecs/es8311_audio_codec.h"
+#include "display/lcd_display.h"
 #include "application.h"
 #include "button.h"
 #include "config.h"
-#include "assets.h"
 #include "esp32_camera.h"
 #include "mcp_server.h"
 
@@ -42,69 +46,90 @@ class MiaoMiaoESP32S3 : public WifiBoard {
 private:
     Button boot_button_;
     Button second_button_;
-    LcdDisplay* display_ = nullptr;
+    Display* display_ = nullptr;
     i2c_master_bus_handle_t codec_i2c_bus_ = nullptr;
     adc_oneshot_unit_handle_t battery_adc_handle_ = nullptr;
 
     void InitializeCodecI2c() {
         // [已确认] codec 控制口 I2C0：SDA=GPIO1, SCL=GPIO2（JTAG 实测）
-        i2c_master_bus_config_t i2c_bus_config = {};
-        i2c_bus_config.i2c_port = 0;
-        i2c_bus_config.sda_io_num = AUDIO_CODEC_I2C_SDA_PIN;
-        i2c_bus_config.scl_io_num = AUDIO_CODEC_I2C_SCL_PIN;
-        i2c_bus_config.clk_flags = I2C_MASTER_CLK_CTRL_DEFAULT_BIT;
-        i2c_bus_config.sda_pullup_en = GPIO_PULLUP_ENABLE;
-        i2c_bus_config.scl_pullup_en = GPIO_PULLUP_ENABLE;
-        i2c_bus_config.master.clk_speed = 100000;
-        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, &codec_i2c_bus_));
+        i2c_master_bus_config_t i2c_bus_cfg = {
+            .i2c_port = I2C_NUM_0,
+            .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
+            .scl_io_num = AUDIO_CODEC_I2C_SCL_PIN,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .intr_priority = 0,
+            .trans_queue_depth = 0,
+            .flags = {
+                .enable_internal_pullup = 1,
+            },
+        };
+        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &codec_i2c_bus_));
+    }
+
+    void InitializeSpi() {
+        // [已确认] SPI3_HOST: CLK=GPIO41, MOSI=GPIO42（两屏并联共用）
+        spi_bus_config_t buscfg = {};
+        buscfg.mosi_io_num = DISPLAY_MOSI_PIN;
+        buscfg.miso_io_num = DISPLAY_MISO_PIN;      // GPIO_NUM_NC
+        buscfg.sclk_io_num = DISPLAY_SCLK_PIN;
+        buscfg.quadwp_io_num = GPIO_NUM_NC;
+        buscfg.quadhd_io_num = GPIO_NUM_NC;
+        buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
+        ESP_ERROR_CHECK(spi_bus_initialize(DISPLAY_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    }
+
+    void InitializeGc9a01Display() {
+        // [已确认] 两屏并联：同总线同 CS(GPIO47) 同 DC(GPIO0)，同步显示
+        esp_lcd_panel_io_handle_t io_handle = nullptr;
+        esp_lcd_panel_io_spi_config_t io_config = {};
+        io_config.cs_gpio_num = DISPLAY_LEFT_CS_PIN;
+        io_config.dc_gpio_num = DISPLAY_LEFT_DC_PIN;
+        io_config.spi_mode = 0;
+        io_config.pclk_hz = DISPLAY_PIXEL_CLOCK_HZ;
+        io_config.trans_queue_depth = 10;
+        io_config.lcd_cmd_bits = 8;
+        io_config.lcd_param_bits = 8;
+        ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(DISPLAY_SPI_HOST, &io_config, &io_handle));
+
+        esp_lcd_panel_handle_t panel_handle = nullptr;
+        esp_lcd_panel_dev_config_t panel_config = {};
+        panel_config.reset_gpio_num = DISPLAY_LEFT_RST_PIN;   // GPIO_NUM_NC（疑似硬件复位）
+        panel_config.rgb_endian = LCD_RGB_ENDIAN_BGR;
+        panel_config.bits_per_pixel = 16;
+        ESP_ERROR_CHECK(esp_lcd_new_panel_gc9a01(io_handle, &panel_config, &panel_handle));
+        ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
+        ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+        ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));   // [已确认] 固件 API 序列
+        ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false));  // [已确认]
+        ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+
+        display_ = new SpiLcdDisplay(io_handle, panel_handle,
+                                     DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                     0, 0,                 // offset_x / offset_y
+                                     DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
     void InitializeButtons() {
         // [已确认] 双按键 GPIO43/44（固件字符串 + 电平实测）
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateIdle) {
-                app.ToggleChatState();
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                EnterWifiConfigMode();
+                return;
             }
+            app.ToggleChatState();
         });
         boot_button_.OnLongPress([this]() {
-            // 与原厂一致：长按显示 MAC 地址界面（GetSystemInfoJson 已含 MAC）
+            // 与原厂一致：长按显示 MAC 地址界面
             auto display = GetDisplay();
             if (display) {
-                display->SetStatus("MAC: " + MacAddressString());
+                display->SetStatus(("MAC: " + MacAddressString()).c_str());
             }
         });
         second_button_.OnClick([this]() {
             Application::GetInstance().ToggleChatState();
         });
-    }
-
-    void InitializeDisplay() {
-        // [已确认] SPI3_HOST: CLK=GPIO41, MOSI=GPIO42, CS=GPIO47（两屏并联共用）
-        // [高置信推断] DC=GPIO0；RST/BL 疑似硬件直通（见 config.h 注释）
-        auto& assets = Assets::GetInstance();
-        auto display_config = assets.GetDisplayConfig();  // [编译核对] index.json 的 240x240
-
-        SpiLcdDisplay* lcd_display = new SpiLcdDisplay(
-            DISPLAY_SPI_HOST,
-            DISPLAY_LEFT_CS_PIN,
-            DISPLAY_LEFT_DC_PIN,
-            DISPLAY_SCLK_PIN,
-            DISPLAY_MOSI_PIN,
-            DISPLAY_MISO_PIN,
-            DISPLAY_BACKLIGHT_PIN,
-            DISPLAY_BACKLIGHT_OUTPUT_INVERT,
-            DISPLAY_WIDTH,
-            DISPLAY_HEIGHT,
-            DISPLAY_OFFSET_X,           // [编译核对] v2.2.2 若无此参数则删去两行
-            DISPLAY_OFFSET_Y,
-            DISPLAY_MIRROR_X,
-            DISPLAY_MIRROR_Y,
-            DISPLAY_SWAP_XY,
-            assets.GetDisplayFonts().text_font,        // [编译核对] 字体来自 assets
-            assets.GetDisplayFonts().icon_font,
-            assets.GetDisplayFonts().emoji_font);
-        display_ = lcd_display;
     }
 
     void InitializeServo() {
@@ -136,42 +161,51 @@ private:
 
 public:
     MiaoMiaoESP32S3()
-        : boot_button_(BOOT_BUTTON_GPIO, false, 0, false),
-          second_button_(SECOND_BUTTON_GPIO, false, 0, false) {   // [编译核对] Button 构造参数
+        : boot_button_(BOOT_BUTTON_GPIO),
+          second_button_(SECOND_BUTTON_GPIO) {
         InitializeCodecI2c();
-        InitializeDisplay();
+        InitializeSpi();
+        InitializeGc9a01Display();
         InitializeButtons();
         InitializeServo();
         InitializeTools();
-        if (DISPLAY_BACKLIGHT_PIN != GPIO_NUM_NC) {
-            GetBacklight()->RestoreBrightness();
-        }
+        // 背光疑似硬件常亮（DISPLAY_BACKLIGHT_PIN=NC），无需 RestoreBrightness
     }
 
     virtual std::string GetBoardType() override { return "miaomiao-esp32s3"; }
 
+    virtual Display* GetDisplay() override {
+        return display_;
+    }
+
+    virtual Backlight* GetBacklight() override {
+        // 背光无控制脚，疑似硬件常亮
+        return nullptr;
+    }
+
     virtual AudioCodec* GetAudioCodec() override {
         // [已确认] ES8311 duplex：16kHz in / 24kHz out（与原厂日志一致）
+        // 双工：BCLK(GPIO38)/WS(GPIO21) 收发共用，DOUT=45(喇叭) DIN=46(麦克风)
         static Es8311AudioCodec audio_codec(
             codec_i2c_bus_,
+            I2C_NUM_0,
             AUDIO_INPUT_SAMPLE_RATE,
             AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_GPIO_MCLK,
-            AUDIO_I2S_SPK_GPIO_BCLK,
-            AUDIO_I2S_SPK_GPIO_LRCK,
-            AUDIO_I2S_SPK_GPIO_DOUT,
-            AUDIO_I2S_MIC_GPIO_SCK,
-            AUDIO_I2S_MIC_GPIO_WS,
-            AUDIO_I2S_MIC_GPIO_DIN,
-            AUDIO_CODEC_ES8311_ADDR);          // [编译核对] 对照 es8311_audio_codec.h 签名
+            AUDIO_I2S_GPIO_MCLK,          // GPIO3
+            AUDIO_I2S_SPK_GPIO_BCLK,      // GPIO38
+            AUDIO_I2S_SPK_GPIO_LRCK,      // GPIO21
+            AUDIO_I2S_SPK_GPIO_DOUT,      // GPIO45
+            AUDIO_I2S_MIC_GPIO_DIN,       // GPIO46
+            AUDIO_PA_ENABLE_PIN,          // GPIO_NUM_NC（功放疑似硬件直通）
+            AUDIO_CODEC_ES8311_ADDR);
         return &audio_codec;
     }
 
     camera_config_t CameraConfig() {
         // [已确认] 完整 DVP 引脚图（JTAG GPIO 矩阵实测），传感器 OV3660
         camera_config_t cfg = {};
-        cfg.ledc_channel = LEDC_CHANNEL_2;      // [编译核对] 舵机占了 CH0/CH1，相机 XCLK 用 CH2
-        cfg.ledc_timer   = LEDC_TIMER_1;        // [编译核对] 舵机占 TIMER0
+        cfg.ledc_channel = LEDC_CHANNEL_2;      // 舵机占了 CH0/CH1，相机 XCLK 用 CH2
+        cfg.ledc_timer   = LEDC_TIMER_1;        // 舵机占 TIMER0
         cfg.pin_pwdn     = CAMERA_PIN_PWDN;
         cfg.pin_reset    = CAMERA_PIN_RESET;
         cfg.pin_xclk     = CAMERA_PIN_XCLK;
@@ -185,7 +219,7 @@ public:
         cfg.pin_href  = CAMERA_PIN_HREF;
         cfg.pin_pclk  = CAMERA_PIN_PCLK;
         cfg.xclk_freq_hz = CAMERA_XCLK_FREQ_HZ;
-        cfg.pixel_format = PIXFORMAT_RGB565;    // 表情屏场景用小帧率，按需调
+        cfg.pixel_format = PIXFORMAT_RGB565;
         cfg.frame_size   = FRAMESIZE_QVGA;
         cfg.fb_location  = CAMERA_FB_IN_PSRAM;  // N16R8 有 8MB PSRAM
         cfg.grab_mode    = CAMERA_GRAB_LATEST;
@@ -193,6 +227,7 @@ public:
     }
 
     virtual Camera* GetCamera() override {
+        // 注册后官方 AddCommonTools 自带 self.camera.take_photo（拍照识物）
         static Esp32Camera camera(CameraConfig());
         return &camera;
     }
@@ -201,7 +236,7 @@ public:
         // [已确认] ADC 通道 3；GPIO 推断 GPIO14，分压比待实测校准
         if (battery_adc_handle_ == nullptr) {
             adc_oneshot_unit_init_cfg_t init_cfg = {};
-            init_cfg.unit_id = BATTERY_ADC_UNIT;          // [编译核对] GPIO14→ADC_UNIT_2
+            init_cfg.unit_id = BATTERY_ADC_UNIT;
             ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg, &battery_adc_handle_));
             adc_oneshot_chan_cfg_t chan_cfg = {
                 .atten = BATTERY_ADC_ATTEN, .bitwidth = ADC_BITWIDTH_DEFAULT,
@@ -211,7 +246,7 @@ public:
         }
         int raw = 0;
         adc_oneshot_read(battery_adc_handle_, BATTERY_ADC_CHANNEL, &raw);
-        int mv = raw * BATTERY_VOLTAGE_RATIO;   // 简化标定；精确值用 adc_cali
+        int mv = static_cast<int>(raw * BATTERY_VOLTAGE_RATIO);   // 简化标定；精确值用 adc_cali
         charging = false;
         discharging = false;
         level = 100 * (mv - BATTERY_EMPTY_MV) / (BATTERY_FULL_MV - BATTERY_EMPTY_MV);
