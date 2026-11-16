@@ -43,23 +43,25 @@ def patch_kconfig() -> bool:
 
 
 def patch_cmake() -> None:
-    """若 main/CMakeLists.txt 显式列出板目录则追加；glob 式则无需改动。"""
+    """在 main/CMakeLists.txt 的 if(CONFIG_BOARD_TYPE_XXX) 映射链头部插入本板分支，
+    使 BOARD_TYPE 变量指向板目录名（源码经 file(GLOB boards/${BOARD_TYPE}/*.cc) 收集）。"""
     cmake = root / "main" / "CMakeLists.txt"
     if not cmake.exists():
         print("[patch] 未找到 main/CMakeLists.txt，跳过")
         return
     text = cmake.read_text(encoding="utf-8")
-    if BOARD_DIR in text:
-        print("[patch] CMakeLists 已含板目录，跳过")
+    if KCONFIG_NAME in text:
+        print("[patch] CMakeLists 已含本板映射，跳过")
         return
-    # 形如 set(BOARD_TYPE_DIRS xxx yyy) 或 list(APPEND BOARD_DIRS ...) 的显式清单
-    m = re.search(r"(set|list\s*\(APPEND)\s*\(?([A-Z_]+(?:BOARD|BOARD_TYPE|BOARD_DIRS)[A-Z_]*)\)?\s+([^)\n]+)", text)
-    if m and not re.search(r"GLOB", text[m.start():m.end() + 400]):
-        new_text = text.replace(m.group(0), m.group(0).rstrip() + " " + BOARD_DIR, 1)
-        cmake.write_text(new_text, encoding="utf-8")
-        print(f"[patch] CMakeLists 已追加 {BOARD_DIR}")
+    m = re.search(r"if\(CONFIG_BOARD_TYPE_[A-Z0-9_]+\)", text)
+    if not m:
+        print("[patch] ⚠️ CMakeLists 中未找到 if(CONFIG_BOARD_TYPE_...) 映射链，需手工添加:")
+        print(f'    if({KCONFIG_NAME})\n        set(BOARD_TYPE "{BOARD_DIR}")')
         return
-    print("[patch] CMakeLists 未显式列出板目录（应为 glob 自动收录），无需改动")
+    branch = f'if({KCONFIG_NAME})\n    set(BOARD_TYPE "{BOARD_DIR}")\n{m.group(0)}'
+    new_text = text[: m.start()] + branch + text[m.start():]
+    cmake.write_text(new_text, encoding="utf-8")
+    print(f'[patch] CMakeLists 已插入映射: {KCONFIG_NAME} -> {BOARD_DIR}')
 
 
 def write_sdkconfig_defaults() -> None:
