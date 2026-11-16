@@ -1,0 +1,55 @@
+name: Build 喵喵机芯盒固件
+
+# 用法：把本目录（机芯盒改造/）推到你的 GitHub 仓库根目录，
+# Actions 会自动拉取 xiaozhi-esp32 v2.2.2、合入定制板、出固件成品。
+
+on:
+  workflow_dispatch:      # 手动触发
+  push:
+    paths:
+      - "source/board/**"
+      - "tools/**"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.5.4
+    steps:
+      - name: Checkout 本仓库（板级源码 + 工具）
+        uses: actions/checkout@v4
+
+      - name: Checkout xiaozhi-esp32 v2.2.2
+        uses: actions/checkout@v4
+        with:
+          repository: 78/xiaozhi-esp32
+          ref: v2.2.2
+          path: xiaozhi
+
+      - name: 合入定制板并打补丁
+        run: |
+          cp -r source/board/miaomiao_esp32s3 xiaozhi/main/boards/miaomiao-esp32s3
+          cd xiaozhi
+          python3 ../tools/patch_board.py .
+
+      - name: 编译
+        working-directory: xiaozhi
+        shell: bash
+        run: |
+          source /opt/esp/idf/export.sh
+          idf.py set-target esp32s3
+          idf.py build
+
+      - name: 收集刷机产物
+        run: |
+          mkdir -p dist
+          cp xiaozhi/build/bootloader/bootloader.bin dist/
+          cp xiaozhi/build/partition_table/partition-table.bin dist/
+          cp xiaozhi/build/*.bin dist/firmware.bin 2>/dev/null || cp xiaozhi/build/xiaozhi.bin dist/firmware.bin
+          cp xiaozhi/build/flash_args dist/ 2>/dev/null || true
+          ls -la dist/
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: miaomiao-firmware
+          path: dist/
