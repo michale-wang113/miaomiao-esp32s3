@@ -21,7 +21,7 @@
 //          DOUT(ESP→codec DSDIN, 喇叭)=GPIO45, DIN(codec ASDOUT→ESP, 麦克风)=GPIO46
 // [已确认] codec 控制口 = I2C0：SDA=GPIO1, SCL=GPIO2
 // -----------------------------------------------------------------------------
-#define AUDIO_INPUT_SAMPLE_RATE  16000
+#define AUDIO_INPUT_SAMPLE_RATE  24000
 #define AUDIO_OUTPUT_SAMPLE_RATE 24000
 
 #define AUDIO_CODEC_ES8311_ENCODE

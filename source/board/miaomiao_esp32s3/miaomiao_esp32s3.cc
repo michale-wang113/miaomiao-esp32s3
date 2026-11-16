@@ -184,7 +184,7 @@ public:
     }
 
     virtual AudioCodec* GetAudioCodec() override {
-        // [已确认] ES8311 duplex：16kHz in / 24kHz out（与原厂日志一致）
+        // [已确认] ES8311 duplex：双工模式下输入输出必须同为 24kHz（官方 v2.2.2 断言要求）
         // 双工：BCLK(GPIO38)/WS(GPIO21) 收发共用，DOUT=45(喇叭) DIN=46(麦克风)
         static Es8311AudioCodec audio_codec(
             codec_i2c_bus_,
