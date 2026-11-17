@@ -19,6 +19,10 @@
 #include <esp_log.h>
 #include <esp_mac.h>
 #include <esp_heap_caps.h>
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#include <algorithm>
 #include <cstdio>
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
@@ -50,6 +54,125 @@ private:
     Display* display_ = nullptr;
     i2c_master_bus_handle_t codec_i2c_bus_ = nullptr;
     adc_oneshot_unit_handle_t battery_adc_handle_ = nullptr;
+
+    // —— 语音备忘录（双按键：按一下录音，再按一下回放）——
+    std::atomic<bool> memo_recording_{false};
+    std::atomic<bool> memo_playing_{false};
+    std::atomic<bool> memo_stop_{false};
+    int16_t* memo_buffer_ = nullptr;                       // PSRAM
+    size_t memo_len_ = 0;                                  // 已录采样数
+    static constexpr size_t kMemoSampleRate = 24000;       // 与 codec 输入/输出同率，免重采样
+    static constexpr size_t kMemoMaxSeconds = 60;
+    static constexpr size_t kMemoMaxSamples = kMemoSampleRate * kMemoMaxSeconds;
+
+    void PlayTone(int freq_hz, int ms, int amp = 6000) {
+        auto codec = GetAudioCodec();
+        codec->EnableOutput(true);
+        vTaskDelay(pdMS_TO_TICKS(30));
+        const int kChunk = 240;
+        int total = (int)kMemoSampleRate * ms / 1000;
+        for (int i = 0; i < total; i += kChunk) {
+            std::vector<int16_t> seg;
+            seg.reserve(kChunk);
+            for (int j = 0; j < kChunk && i + j < total; j++) {
+                int n = i + j;
+                float env = std::min(1.0f, std::min((float)n / (total * 0.15f),
+                                                    (float)(total - n) / (total * 0.15f)));
+                seg.push_back((int16_t)(amp * env * sinf(2.0f * (float)M_PI * freq_hz * n / kMemoSampleRate)));
+            }
+            codec->OutputData(seg);
+        }
+    }
+
+    void VoiceMemoTask() {
+        auto& audio = Application::GetInstance().GetAudioService();
+        auto codec = GetAudioCodec();
+
+        // 录音期间暂停唤醒词检测，独占麦克风输入
+        audio.EnableWakeWordDetection(false);
+        vTaskDelay(pdMS_TO_TICKS(120));
+
+        // 提示音：一声短哔 = 开始录音
+        PlayTone(880, 150);
+
+        size_t silence_frames = 0;
+        std::vector<int16_t> chunk;
+        memo_len_ = 0;
+        while (memo_len_ < kMemoMaxSamples) {
+            chunk.assign(1024, 0);
+            if (!audio.ReadAudioData(chunk, kMemoSampleRate, 1024)) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            memcpy(memo_buffer_ + memo_len_, chunk.data(),
+                   std::min(chunk.size(), kMemoMaxSamples - memo_len_) * sizeof(int16_t));
+            memo_len_ += std::min(chunk.size(), kMemoMaxSamples - memo_len_);
+            if (memo_stop_.load()) break;
+            // 静音自动截断：连续 3 秒无声提前结束录音
+            int64_t energy = 0;
+            for (size_t i = 0; i < chunk.size(); i += 16) energy += abs(chunk[i]);
+            if (energy / (chunk.size() / 16 + 1) < 60) {
+                if (++silence_frames >= kMemoSampleRate / 1024 * 3) break;
+            } else {
+                silence_frames = 0;
+            }
+        }
+        memo_recording_ = false;
+
+        ESP_LOGI(TAG, "[备忘录] 录音结束：%.1f 秒，开始回放", (float)memo_len_ / kMemoSampleRate);
+        vTaskDelay(pdMS_TO_TICKS(150));
+
+        // 回放
+        memo_playing_ = true;
+        codec->EnableOutput(true);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        const size_t kPlayChunk = 960;
+        for (size_t pos = 0; pos < memo_len_; pos += kPlayChunk) {
+            size_t n = std::min(kPlayChunk, memo_len_ - pos);
+            std::vector<int16_t> out(memo_buffer_ + pos, memo_buffer_ + pos + n);
+            codec->OutputData(out);
+        }
+        // 结束提示音：两声短哔
+        PlayTone(1320, 120);
+        PlayTone(1320, 120);
+        codec->EnableOutput(false);
+        memo_playing_ = false;
+
+        // 恢复唤醒词
+        audio.EnableWakeWordDetection(true);
+        ESP_LOGI(TAG, "[备忘录] 回放完成");
+        vTaskDelete(nullptr);
+    }
+
+    static void VoiceMemoTaskEntry(void* arg) {
+        static_cast<MiaoMiaoESP32S3*>(arg)->VoiceMemoTask();
+    }
+
+    void ToggleVoiceMemo() {
+        if (memo_recording_.load()) {
+            // 第二次按下：停止录音 → 回放
+            memo_stop_ = true;
+            return;
+        }
+        if (memo_playing_.load()) {
+            return;  // 回放中忽略按键
+        }
+        // 空闲状态：开始录音
+        if (!memo_buffer_) {
+            memo_buffer_ = (int16_t*)heap_caps_malloc(
+                kMemoMaxSamples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+            if (!memo_buffer_) {
+                ESP_LOGE(TAG, "[备忘录] PSRAM 缓冲分配失败（%d 字节）", (int)(kMemoMaxSamples * 2));
+                return;
+            }
+        }
+        memo_stop_ = false;
+        memo_recording_ = true;
+        ESP_LOGI(TAG, "[备忘录] 开始录音（GPIO43/44 再按一次回放，最长 60 秒）");
+        if (xTaskCreate(&MiaoMiaoESP32S3::VoiceMemoTaskEntry, "VoiceMemo", 6144, this, 4, nullptr) != pdPASS) {
+            memo_recording_ = false;
+        }
+    }
 
     void InitializeCodecI2c() {
         // [已确认] codec 控制口 I2C0：SDA=GPIO1, SCL=GPIO2（JTAG 实测）
@@ -132,13 +255,19 @@ private:
 
     void InitializeButtons() {
         // [已确认] 双按键 GPIO43/44（固件字符串 + 电平实测）
+        // 新功能：按一下录音，再按一下回放（语音备忘录）
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
                 return;
             }
-            app.ToggleChatState();
+            if (app.GetDeviceState() != kDeviceStateIdle) {
+                // 对话/播放等非空闲状态：先退出当前状态
+                app.ToggleChatState();
+                return;
+            }
+            ToggleVoiceMemo();
         });
         boot_button_.OnLongPress([this]() {
             // 与原厂一致：长按显示 MAC 地址界面
@@ -148,7 +277,12 @@ private:
             }
         });
         second_button_.OnClick([this]() {
-            Application::GetInstance().ToggleChatState();
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() != kDeviceStateIdle) {
+                app.ToggleChatState();
+                return;
+            }
+            ToggleVoiceMemo();
         });
     }
 
