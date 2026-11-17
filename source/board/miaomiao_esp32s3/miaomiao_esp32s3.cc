@@ -18,7 +18,6 @@
 
 #include <esp_log.h>
 #include <esp_mac.h>
-#include <esp_heap_caps.h>
 #include <cstdio>
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
@@ -104,23 +103,6 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));   // [已确认] 固件 API 序列
         ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false));  // [已确认]
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
-
-        // [屏幕诊断] 绕过 LVGL 直接刷白屏 3 秒：白屏=panel/SPI/DC 链路通，问题在渲染层；黑屏=面板初始化问题
-        {
-            const int kRows = 16;
-            uint16_t* line = (uint16_t*)heap_caps_malloc(DISPLAY_WIDTH * kRows * sizeof(uint16_t), MALLOC_CAP_DMA);
-            if (line) {
-                for (int i = 0; i < DISPLAY_WIDTH * kRows; i++) line[i] = 0xFFFF;
-                for (int y = 0; y < DISPLAY_HEIGHT; y += kRows) {
-                    esp_lcd_panel_draw_bitmap(panel_handle, 0, y, DISPLAY_WIDTH, y + kRows, line);
-                }
-                ESP_LOGI(TAG, "[屏幕测试] 白屏已发送，3 秒后交还 LVGL");
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                heap_caps_free(line);
-            } else {
-                ESP_LOGE(TAG, "[屏幕测试] DMA 缓冲分配失败");
-            }
-        }
 
         display_ = new SpiLcdDisplay(io_handle, panel_handle,
                                      DISPLAY_WIDTH, DISPLAY_HEIGHT,
