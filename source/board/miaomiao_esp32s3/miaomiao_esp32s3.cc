@@ -247,6 +247,14 @@ private:
     }
 
     void InitializeGc9a01Display() {
+        // [复刻 vendor] GPIO0(DC) IO_MUX 清除 FUN_WPU(bit8)+FUN_IE(bit9)：
+        // JTAG 对比唯一剩余寄存器差异（vendor=0x1802, ours=0x1b02）
+        {
+            uint32_t mux_before = RegRd32(0x60009004);
+            *(volatile uint32_t*)0x60009004 = mux_before & ~0x300u;
+            ESP_LOGI(TAG, "[DC-MUX] GPIO0 IO_MUX 0x%08x → 0x%08x (复刻 vendor: 无上拉/无输入使能)",
+                     mux_before, RegRd32(0x60009004));
+        }
         // [Debug] 双核各装 GPIO_ENABLE_W1TC 写观察点 + 1ms 哨兵任务
         xTaskCreatePinnedToCore(Gpio0WatchpointTask, "wp0", 3072, nullptr, 20, nullptr, 0);
         xTaskCreatePinnedToCore(Gpio0WatchpointTask, "wp1", 3072, nullptr, 20, nullptr, 1);
@@ -307,29 +315,23 @@ private:
                     esp_lcd_panel_draw_bitmap(panel_handle, 0, y, DISPLAY_WIDTH, y + kRows, line);
                     if (y == 0) LogGpio0State("第1行白屏后");
                 }
-                ESP_LOGI(TAG, "[屏幕测试] 白屏保持 5 秒后进入命令应答实验");
+                ESP_LOGI(TAG, "[屏幕测试] 白屏保持 5 秒后进入白黑交替闪烁（60 秒，每 3 秒切换）");
                 LogGpio0State("白屏后");
                 vTaskDelay(pdMS_TO_TICKS(5000));
-
-                // [决定性实验] 命令应答：面板是否听我们的命令
-                ESP_LOGI(TAG, "[应答B1] INVON 0x21 → 若面板活着且听命令，深灰应变白（2秒）");
-                esp_lcd_panel_io_tx_param(io_handle, 0x21, nullptr, 0);
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                ESP_LOGI(TAG, "[应答B2] INVOFF 0x20 → 白应变深灰（2秒）");
-                esp_lcd_panel_io_tx_param(io_handle, 0x20, nullptr, 0);
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                ESP_LOGI(TAG, "[应答B3] INVON 0x21 再次 → 深灰应变白（2秒）");
-                esp_lcd_panel_io_tx_param(io_handle, 0x21, nullptr, 0);
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                ESP_LOGI(TAG, "[应答B4] DISPOFF 0x28 → 应黑屏（2秒）");
-                esp_lcd_panel_io_tx_param(io_handle, 0x28, nullptr, 0);
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                ESP_LOGI(TAG, "[应答B5] DISPON 0x29 + INVON 0x21 → 恢复");
-                esp_lcd_panel_io_tx_param(io_handle, 0x29, nullptr, 0);
-                esp_lcd_panel_io_tx_param(io_handle, 0x21, nullptr, 0);
-                vTaskDelay(pdMS_TO_TICKS(2000));
-
-                ESP_LOGI(TAG, "[屏幕测试] 应答实验结束，交还 LVGL");
+                // [极简实验] 白黑交替闪烁 10 轮：屏幕只要在切换点变化 = 面板活着听命令
+                for (int cyc = 0; cyc < 10; cyc++) {
+                    for (int i = 0; i < DISPLAY_WIDTH * kRows; i++) line[i] = 0xFFFF;
+                    for (int y = 0; y < DISPLAY_HEIGHT; y += kRows)
+                        esp_lcd_panel_draw_bitmap(panel_handle, 0, y, DISPLAY_WIDTH, y + kRows, line);
+                    ESP_LOGI(TAG, "[闪烁] 第 %d 轮 → 白", cyc + 1);
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                    for (int i = 0; i < DISPLAY_WIDTH * kRows; i++) line[i] = 0x0000;
+                    for (int y = 0; y < DISPLAY_HEIGHT; y += kRows)
+                        esp_lcd_panel_draw_bitmap(panel_handle, 0, y, DISPLAY_WIDTH, y + kRows, line);
+                    ESP_LOGI(TAG, "[闪烁] 第 %d 轮 → 黑", cyc + 1);
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                }
+                ESP_LOGI(TAG, "[屏幕测试] 闪烁实验结束，交还 LVGL");
                 heap_caps_free(line);
             } else {
                 ESP_LOGE(TAG, "[屏幕测试] DMA 缓冲分配失败");
@@ -416,10 +418,9 @@ public:
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         InitializeSpi();
         InitializeGc9a01Display();
-        InitializeButtons();
-        LogGpio0State("按键后");
-        InitializeServo();
-        LogGpio0State("舵机后");
+        // [极简实验] 按用户要求：电机/按键/摄像头全部停用，只留屏幕+音频
+        // InitializeButtons();
+        // InitializeServo();
         InitializeTools();
         LogGpio0State("工具后");
         // 背光疑似硬件常亮（DISPLAY_BACKLIGHT_PIN=NC），无需 RestoreBrightness
