@@ -318,9 +318,12 @@ public:
         : boot_button_(BOOT_BUTTON_GPIO),
           second_button_(SECOND_BUTTON_GPIO) {
         InitializeCodecI2c();
-        // [内存时序] 原厂顺序：摄像头先于显示初始化。若 LVGL 先占用 2MB PSRAM 缓存，
-        // 摄像头的 PSRAM DMA 大块连续内存分配会失败（frames malloc failed），故在此预创建。
-        GetCamera();
+        // [屏幕回退实验] 摄像头恢复懒加载（屏幕正常时的原顺序）；fb_count=2 已修复分配问题，
+        // 预初始化不再必要。若屏幕恢复 → 嫌疑锁定为摄像头预初始化/PSRAM_DMA。
+        ESP_LOGI(TAG, "[内存] 显示初始化前 largest DMA=%u free DMA=%u PSRAM free=%u",
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         InitializeSpi();
         InitializeGc9a01Display();
         InitializeButtons();

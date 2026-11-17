@@ -76,9 +76,9 @@ def write_sdkconfig_defaults() -> None:
         lines = [l for l in defaults.read_text(encoding="utf-8").splitlines()
                  if "BOARD_TYPE" not in l]
     lines.append(f"CONFIG_BOARD_TYPE_{KCONFIG_NAME.replace('BOARD_TYPE_', '')}=y")
-    # 摄像头 DMA 直读 PSRAM（esp32-camera v2.x，S3 可用）：避免内部 RAM 不足导致 frames malloc failed
-    if "CAMERA_PSRAM_DMA" not in lines:
-        lines.append("CONFIG_CAMERA_PSRAM_DMA=y")
+    # [屏幕回退实验] 暂时移除 CAMERA_PSRAM_DMA 注入（嫌疑：该配置改 DMA/缓存行为导致显示乱码）
+    # if "CAMERA_PSRAM_DMA" not in lines:
+    #     lines.append("CONFIG_CAMERA_PSRAM_DMA=y")
     defaults.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("[patch] sdkconfig.defaults 已写入默认板型")
 
