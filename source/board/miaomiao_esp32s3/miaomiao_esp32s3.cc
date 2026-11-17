@@ -224,6 +224,7 @@ public:
         cfg.xclk_freq_hz = CAMERA_XCLK_FREQ_HZ;
         cfg.pixel_format = PIXFORMAT_RGB565;
         cfg.frame_size   = FRAMESIZE_QVGA;
+        cfg.fb_count     = 2;                   // [关键修复] 缺省为 0 会导致 frame_cnt=0，calloc(0)=NULL → frames malloc failed
         cfg.fb_location  = CAMERA_FB_IN_PSRAM;  // N16R8 有 8MB PSRAM
         cfg.grab_mode    = CAMERA_GRAB_LATEST;
         return cfg;
