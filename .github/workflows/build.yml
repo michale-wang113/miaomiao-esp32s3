@@ -45,6 +45,7 @@ jobs:
           cp xiaozhi/build/bootloader/bootloader.bin dist/
           cp xiaozhi/build/partition_table/partition-table.bin dist/
           cp xiaozhi/build/*.bin dist/firmware.bin 2>/dev/null || cp xiaozhi/build/xiaozhi.bin dist/firmware.bin
+          cp xiaozhi/build/*.elf dist/ 2>/dev/null || true
           cp xiaozhi/build/flash_args dist/ 2>/dev/null || true
           ls -la dist/
 

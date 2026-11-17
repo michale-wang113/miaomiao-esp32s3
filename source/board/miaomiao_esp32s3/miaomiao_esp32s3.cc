@@ -19,6 +19,7 @@
 #include <esp_log.h>
 #include <esp_mac.h>
 #include <esp_heap_caps.h>
+#include <esp_cpu.h>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -43,6 +44,45 @@
 #include "servo_controller.h"
 
 extern void RegisterServoTools();
+
+// ============================================================
+// [Debug] GPIO0(DC) 输出使能哨兵 — 排查屏幕乱码（DC 被人改成输入）
+//   EN0  = GPIO_ENABLE_REG    @0x60004020 (bit0 = GPIO0 输出使能)
+//   W1TC = GPIO_ENABLE_W1TC   @0x6000402C (写 1 清除输出使能)
+//   MUX  = IO_MUX GPIO0       @0x60009004
+// ============================================================
+static uint32_t RegRd32(uint32_t addr) { return *(volatile uint32_t*)addr; }
+
+static void LogGpio0State(const char* where) {
+    uint32_t en0 = RegRd32(0x60004020);
+    uint32_t mux = RegRd32(0x60009004);
+    ESP_LOGI("Board", "[哨兵] %-14s EN0=0x%08x bit0=%d MUX0=0x%08x", where, en0, (int)(en0 & 1), mux);
+}
+
+static void Gpio0WatchpointTask(void* arg) {
+    // 对 GPIO_ENABLE_W1TC 的任何写 = 有人在关 0-31 号脚的输出使能 → panic 留下调用栈
+    esp_err_t err = esp_cpu_set_watchpoint(0, (const void*)0x6000402C, 4, ESP_CPU_WATCHPOINT_STORE);
+    ESP_LOGI("Board", "[哨兵] CPU%d 观察点安装: %s", (int)xPortGetCoreID(), esp_err_to_name(err));
+    vTaskDelete(nullptr);
+}
+
+static void Gpio0SentinelTask(void* arg) {
+    int last = -1;
+    uint32_t last_mux = 0;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(15000);
+    while (xTaskGetTickCount() < deadline) {
+        int bit0 = (int)(RegRd32(0x60004020) & 1);
+        uint32_t mux = RegRd32(0x60009004);
+        if (last >= 0 && (bit0 != last || mux != last_mux)) {
+            ESP_LOGW("Board", "[哨兵] GPIO0 状态翻转! bit0 %d->%d MUX0 0x%08x->0x%08x", last, bit0, last_mux, mux);
+        }
+        last = bit0;
+        last_mux = mux;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    ESP_LOGI("Board", "[哨兵] 15 秒监视结束");
+    vTaskDelete(nullptr);
+}
 extern void RegisterDisplayTools();
 
 #define TAG "MiaoMiaoBoard"
@@ -204,6 +244,11 @@ private:
     }
 
     void InitializeGc9a01Display() {
+        // [Debug] 双核各装 GPIO_ENABLE_W1TC 写观察点 + 1ms 哨兵任务
+        xTaskCreatePinnedToCore(Gpio0WatchpointTask, "wp0", 3072, nullptr, 20, nullptr, 0);
+        xTaskCreatePinnedToCore(Gpio0WatchpointTask, "wp1", 3072, nullptr, 20, nullptr, 1);
+        xTaskCreate(Gpio0SentinelTask, "gpio0sent", 4096, nullptr, 15, nullptr);
+
         // [已确认] 两屏并联：同总线同 CS(GPIO47) 同 DC(GPIO0)，同步显示
         esp_lcd_panel_io_handle_t io_handle = nullptr;
         esp_lcd_panel_io_spi_config_t io_config = {};
@@ -215,6 +260,7 @@ private:
         io_config.lcd_cmd_bits = 8;
         io_config.lcd_param_bits = 8;
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(DISPLAY_SPI_HOST, &io_config, &io_handle));
+        LogGpio0State("panel_io后");
 
         esp_lcd_panel_handle_t panel_handle = nullptr;
         esp_lcd_panel_dev_config_t panel_config = {};
@@ -227,6 +273,7 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));   // [已确认] 固件 API 序列
         ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false));  // [已确认]
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+        LogGpio0State("panel_init后");
 
         // [屏幕对照实验] 绕过 LVGL 直接刷白屏 3 秒：
         // 白屏可见 = panel/SPI/DC 写入链路通 → 黑屏问题在渲染层；
@@ -240,6 +287,7 @@ private:
                     esp_lcd_panel_draw_bitmap(panel_handle, 0, y, DISPLAY_WIDTH, y + kRows, line);
                 }
                 ESP_LOGI(TAG, "[屏幕测试] 白屏已发送，3 秒后交还 LVGL");
+                LogGpio0State("白屏后");
                 vTaskDelay(pdMS_TO_TICKS(3000));
                 heap_caps_free(line);
             } else {
@@ -251,6 +299,7 @@ private:
                                      DISPLAY_WIDTH, DISPLAY_HEIGHT,
                                      0, 0,                 // offset_x / offset_y
                                      DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        LogGpio0State("SpiLcdDisplay后");
     }
 
     void InitializeButtons() {
@@ -327,8 +376,11 @@ public:
         InitializeSpi();
         InitializeGc9a01Display();
         InitializeButtons();
+        LogGpio0State("按键后");
         InitializeServo();
+        LogGpio0State("舵机后");
         InitializeTools();
+        LogGpio0State("工具后");
         // 背光疑似硬件常亮（DISPLAY_BACKLIGHT_PIN=NC），无需 RestoreBrightness
     }
 
