@@ -5,12 +5,13 @@
 //  1) LEDC 50Hz / 13bit 输出标准舵机 PWM，脉宽范围可在 config.h 标定
 //  2) MoveTo(angle, duration_ms) 用 esp_timer 每 20ms 递进一格占空比，
 //     duration_ms 越大转得越慢 —— 这就是"慢慢转"的物理实现
-//  3) 内部队列 + 任务串行化，避免多舵机同时启动的电流冲击（brownout）
-//     两个舵机同时动作时强制错开 50ms 上电（照抄社区实测结论）
+//  3) 每舵机独立 ramp 槽 + 独立队列：两个舵机可同时动作（各按各的时序），
+//     仅初始化上电时错峰 50ms 防电流冲击；同通道动作保持 FIFO 顺序
 //  4) 对外只暴露语义化接口，MCP 层只做参数搬运
 // =============================================================================
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -86,21 +87,21 @@ private:
     };
 
     bool ready_ = false;
-    std::deque<Step> queue_;
+    std::deque<Step> queues_[SERVO_COUNT];   // 每舵机独立队列
     std::mutex mutex_;
     TaskHandle_t worker_ = nullptr;
-    esp_timer_handle_t timer_ = nullptr;
+    esp_timer_handle_t timer_ = nullptr;     // 单一定时器轮询所有活动 ramp
 
-    // 插值运行时状态
+    // 插值运行时状态（每舵机独立，允许同时动作）
     struct Ramp {
-        bool active = false;
+        std::atomic<bool> active{false};
         int index = -1;
         int from_pulse = 0;
         int to_pulse = 0;
         int total_steps = 0;
         int step_index = 0;
     };
-    Ramp ramp_;
+    Ramp ramps_[SERVO_COUNT];
 
     // 连续转动模式的自动停止定时器（每通道一个）
     esp_timer_handle_t cont_timer_[SERVO_COUNT] = {nullptr, nullptr};

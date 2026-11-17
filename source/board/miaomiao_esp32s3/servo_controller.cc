@@ -56,7 +56,7 @@ bool ServoController::Initialize() {
         vTaskDelay(pdMS_TO_TICKS(kStaggerMs));
     }
 
-    // 3) 插值定时器（一次性，每次动作重新 Start）
+    // 3) 插值定时器（常驻周期运行，回调内轮询所有活动 ramp）
     esp_timer_create_args_t t_args = {};
     t_args.callback = &ServoController::TimerCallback;
     t_args.arg      = this;
@@ -65,8 +65,9 @@ bool ServoController::Initialize() {
         ESP_LOGE(TAG, "插值定时器创建失败");
         return false;
     }
+    esp_timer_start_periodic(timer_, kStepIntervalMs * 1000);
 
-    // 4) 工作线程：串行消费动作队列
+    // 4) 工作线程：按舵机独立消费各自队列（不同舵机可同时动作）
     xTaskCreate(&ServoController::WorkerTask, "ServoTask", 3072, this, 5, &worker_);
 
     // 5) 连续转动模式的自动停止定时器（每通道一个，惰性使用）
@@ -117,7 +118,12 @@ void ServoController::ApplyPulse(Channel& ch, int pulse_us) {
 
 void ServoController::Enqueue(Step step) {
     std::lock_guard<std::mutex> lock(mutex_);
-    queue_.push_back(step);
+    if (step.index < 0) {
+        // -1 = 两个舵机同一动作
+        for (int i = 0; i < SERVO_COUNT; ++i) queues_[i].push_back(step);
+    } else {
+        queues_[step.index].push_back(step);
+    }
 }
 
 bool ServoController::MoveTo(int index, int angle, int duration_ms) {
@@ -221,8 +227,8 @@ bool ServoController::Drive(int index, int direction, int speed_percent, int dur
     if (speed_percent == 0) direction = 0;
     duration_ms = std::clamp(duration_ms, 0, 60000);
 
-    // 等角度插值结束（同通道互斥）
-    while (ramp_.active && ramp_.index == index) {
+    // 等本通道角度插值结束（同通道互斥；不同通道互不影响）
+    while (ramps_[index].active) {
         vTaskDelay(pdMS_TO_TICKS(kStepIntervalMs));
     }
 
@@ -254,71 +260,63 @@ void ServoController::ContStopCallback(void* arg) {
 // ---------------------------------------------------------------------------
 void ServoController::TimerCallback(void* arg) {
     auto* self = static_cast<ServoController*>(arg);
-    if (!self->ramp_.active) return;
+    // 轮询所有通道的活动 ramp —— 各舵机独立推进，互不阻塞
+    for (int i = 0; i < SERVO_COUNT; ++i) {
+        Ramp& r = self->ramps_[i];
+        if (!r.active) continue;
 
-    Ramp& r = self->ramp_;
-    r.step_index++;
-    if (r.step_index >= r.total_steps) {
-        // 收尾：精确落到目标脉宽
-        Channel& ch = self->channels_[r.index];
-        self->ApplyPulse(ch, r.to_pulse);
-        ch.current_angle = ch.target_angle;
-        r.active = false;
-        esp_timer_stop(self->timer_);
-        return;
+        r.step_index++;
+        if (r.step_index >= r.total_steps) {
+            // 收尾：精确落到目标脉宽
+            Channel& ch = self->channels_[i];
+            self->ApplyPulse(ch, r.to_pulse);
+            ch.current_angle = ch.target_angle;
+            r.active = false;
+            continue;
+        }
+
+        // 线性插值（如需更自然可换 ease-in-out：t = t*t*(3-2t)）
+        float t = static_cast<float>(r.step_index) / static_cast<float>(r.total_steps);
+        int pulse = r.from_pulse +
+                    static_cast<int>(std::lround((r.to_pulse - r.from_pulse) * t));
+        self->ApplyPulse(self->channels_[i], pulse);
     }
-
-    // 线性插值（如需更自然可换 ease-in-out：t = t*t*(3-2t)）
-    float t = static_cast<float>(r.step_index) / static_cast<float>(r.total_steps);
-    int pulse = r.from_pulse +
-                static_cast<int>(std::lround((r.to_pulse - r.from_pulse) * t));
-    self->ApplyPulse(self->channels_[r.index], pulse);
 }
 
 void ServoController::WorkerTask(void* arg) {
     auto* self = static_cast<ServoController*>(arg);
     while (true) {
-        Step step;
-        {
-            std::lock_guard<std::mutex> lock(self->mutex_);
-            if (self->queue_.empty()) {
-                step.index = -2;
-            } else {
-                step = self->queue_.front();
-                self->queue_.pop_front();
+        for (int i = 0; i < SERVO_COUNT; ++i) {
+            if (self->ramps_[i].active) continue;   // 本通道上一个动作还在走
+
+            Step step;
+            {
+                std::lock_guard<std::mutex> lock(self->mutex_);
+                if (self->queues_[i].empty()) continue;
+                step = self->queues_[i].front();
+                self->queues_[i].pop_front();
             }
-        }
-        if (step.index == -2) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
 
-        Channel& ch = self->channels_[step.index];
-        ch.target_angle = step.angle;
-        int to_pulse = AngleToPulse(step.angle);
+            Channel& ch = self->channels_[i];
+            ch.target_angle = step.angle;
+            int to_pulse = AngleToPulse(step.angle);
 
-        if (step.duration_ms < kStepIntervalMs) {
-            // 瞬时到位
-            self->ApplyPulse(ch, to_pulse);
-            ch.current_angle = step.angle;
-            continue;
-        }
+            if (step.duration_ms < kStepIntervalMs) {
+                // 瞬时到位
+                self->ApplyPulse(ch, to_pulse);
+                ch.current_angle = step.angle;
+                continue;
+            }
 
-        // 渐进插值：等前一个动作跑完（ramp 单槽，简单可靠）
-        while (self->ramp_.active) {
-            vTaskDelay(pdMS_TO_TICKS(kStepIntervalMs));
+            // 渐进插值：每舵机独立 ramp，不同舵机互不等待
+            Ramp& r = self->ramps_[i];
+            r.index       = i;
+            r.from_pulse  = ch.pulse_us;
+            r.to_pulse    = to_pulse;
+            r.total_steps = step.duration_ms / kStepIntervalMs;
+            r.step_index  = 0;
+            r.active      = true;
         }
-        self->ramp_.active      = true;
-        self->ramp_.index       = step.index;
-        self->ramp_.from_pulse  = ch.pulse_us;
-        self->ramp_.to_pulse    = to_pulse;
-        self->ramp_.total_steps = step.duration_ms / kStepIntervalMs;
-        self->ramp_.step_index  = 0;
-        esp_timer_start_periodic(self->timer_, kStepIntervalMs * 1000);
-
-        // 等到这段插值走完再取下一个动作
-        while (self->ramp_.active) {
-            vTaskDelay(pdMS_TO_TICKS(kStepIntervalMs));
-        }
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
