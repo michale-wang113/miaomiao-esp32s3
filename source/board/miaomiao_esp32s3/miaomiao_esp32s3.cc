@@ -307,9 +307,9 @@ private:
                     esp_lcd_panel_draw_bitmap(panel_handle, 0, y, DISPLAY_WIDTH, y + kRows, line);
                     if (y == 0) LogGpio0State("第1行白屏后");
                 }
-                ESP_LOGI(TAG, "[屏幕测试] 白屏已发送，3 秒后交还 LVGL");
+                ESP_LOGI(TAG, "[屏幕测试] 白屏保持 12 秒：若在约 3.5 秒（摄像头初始化）时突然变暗/出现条纹 = 摄像头初始化破坏显示，当场抓获");
                 LogGpio0State("白屏后");
-                vTaskDelay(pdMS_TO_TICKS(3000));
+                vTaskDelay(pdMS_TO_TICKS(12000));
                 heap_caps_free(line);
             } else {
                 ESP_LOGE(TAG, "[屏幕测试] DMA 缓冲分配失败");
@@ -461,9 +461,12 @@ public:
     }
 
     virtual Camera* GetCamera() override {
+        // [诊断实验] 暂时禁用摄像头初始化：若显示恢复 → 摄像头初始化就是显示破坏真凶
+        ESP_LOGW(TAG, "[诊断] 摄像头初始化已跳过（显示排查实验）");
+        return nullptr;
         // 注册后官方 AddCommonTools 自带 self.camera.take_photo（拍照识物）
-        static Esp32Camera camera(CameraConfig());
-        return &camera;
+        // static Esp32Camera camera(CameraConfig());
+        // return &camera;
     }
 
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
