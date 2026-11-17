@@ -48,15 +48,18 @@ extern void RegisterServoTools();
 // ============================================================
 // [Debug] GPIO0(DC) 输出使能哨兵 — 排查屏幕乱码（DC 被人改成输入）
 //   EN0  = GPIO_ENABLE_REG    @0x60004020 (bit0 = GPIO0 输出使能)
+//   OUT0 = GPIO_OUT_REG       @0x60004004 (bit0 = GPIO0 电平)
 //   W1TC = GPIO_ENABLE_W1TC   @0x6000402C (写 1 清除输出使能)
 //   MUX  = IO_MUX GPIO0       @0x60009004
 // ============================================================
 static uint32_t RegRd32(uint32_t addr) { return *(volatile uint32_t*)addr; }
 
 static void LogGpio0State(const char* where) {
-    uint32_t en0 = RegRd32(0x60004020);
-    uint32_t mux = RegRd32(0x60009004);
-    ESP_LOGI("Board", "[哨兵] %-14s EN0=0x%08x bit0=%d MUX0=0x%08x", where, en0, (int)(en0 & 1), mux);
+    uint32_t en0  = RegRd32(0x60004020);
+    uint32_t out0 = RegRd32(0x60004004);
+    uint32_t mux  = RegRd32(0x60009004);
+    ESP_LOGI("Board", "[DC-TRACK] %-14s OE=%d LVL=%d EN0=0x%08x MUX0=0x%08x",
+             where, (int)(en0 & 1), (int)((out0 >> 0) & 1), en0, mux);
 }
 
 static void Gpio0WatchpointTask(void* arg) {
@@ -67,20 +70,20 @@ static void Gpio0WatchpointTask(void* arg) {
 }
 
 static void Gpio0SentinelTask(void* arg) {
-    int last = -1;
-    uint32_t last_mux = 0;
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(15000);
+    // 注意：pdMS_TO_TICKS 在 HZ=100 下会把小毫秒数整除成 0（死循环饿死主任务），故用裸 tick
+    int last_oe = -1, last_lvl = -1;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(40000);
     while (xTaskGetTickCount() < deadline) {
-        int bit0 = (int)(RegRd32(0x60004020) & 1);
-        uint32_t mux = RegRd32(0x60009004);
-        if (last >= 0 && (bit0 != last || mux != last_mux)) {
-            ESP_LOGW("Board", "[哨兵] GPIO0 状态翻转! bit0 %d->%d MUX0 0x%08x->0x%08x", last, bit0, last_mux, mux);
+        int oe  = (int)(RegRd32(0x60004020) & 1);
+        int lvl = (int)(RegRd32(0x60004004) & 1);
+        if (last_oe >= 0 && (oe != last_oe || lvl != last_lvl)) {
+            ESP_LOGW("Board", "[DC-TRACK] 翻转! OE %d->%d LVL %d->%d", last_oe, oe, last_lvl, lvl);
         }
-        last = bit0;
-        last_mux = mux;
-        vTaskDelay(pdMS_TO_TICKS(1));
+        last_oe = oe;
+        last_lvl = lvl;
+        vTaskDelay(1);   // 1 tick（10ms），不饿死主任务
     }
-    ESP_LOGI("Board", "[哨兵] 15 秒监视结束");
+    ESP_LOGI("Board", "[哨兵] 40 秒监视结束");
     vTaskDelete(nullptr);
 }
 extern void RegisterDisplayTools();
@@ -269,11 +272,15 @@ private:
         panel_config.bits_per_pixel = 16;
         ESP_ERROR_CHECK(esp_lcd_new_panel_gc9a01(io_handle, &panel_config, &panel_handle));
         ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
+        LogGpio0State("reset后");
         ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+        LogGpio0State("init后");
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));   // [已确认] 固件 API 序列
+        LogGpio0State("invert后");
         ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false));  // [已确认]
+        LogGpio0State("mirror后");
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
-        LogGpio0State("panel_init后");
+        LogGpio0State("disp_on后");
 
         // [屏幕对照实验] 绕过 LVGL 直接刷白屏 3 秒：
         // 白屏可见 = panel/SPI/DC 写入链路通 → 黑屏问题在渲染层；
@@ -285,6 +292,7 @@ private:
                 for (int i = 0; i < DISPLAY_WIDTH * kRows; i++) line[i] = 0xFFFF;
                 for (int y = 0; y < DISPLAY_HEIGHT; y += kRows) {
                     esp_lcd_panel_draw_bitmap(panel_handle, 0, y, DISPLAY_WIDTH, y + kRows, line);
+                    if (y == 0) LogGpio0State("第1行白屏后");
                 }
                 ESP_LOGI(TAG, "[屏幕测试] 白屏已发送，3 秒后交还 LVGL");
                 LogGpio0State("白屏后");
