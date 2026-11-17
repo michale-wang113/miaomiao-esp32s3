@@ -265,14 +265,27 @@ private:
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(DISPLAY_SPI_HOST, &io_config, &io_handle));
         LogGpio0State("panel_io后");
 
+        // [时序修复实验] 上电竞态假设：
+        //  - 本板无软件复位线（RST=NC，走硬件 RC 复位），面板复位释放时刻不受控；
+        //  - 冷启动时电池升压电路 + RC 复位可能未稳，t≈250ms 即发命令易被欠压面板吞掉
+        //    → GRAM 随机 → 彩虹条纹；热复位（面板已供电）则成功 —— 与"时好时坏"吻合；
+        //  - 组件默认时序低于 GC9A01 规格：SWRESET 后等 20ms（规格 120ms）、
+        //    SLPOUT 后等 100ms（规格 120ms）；
+        //  - 修复：先给 400ms 供电稳定延时，再手动 SWRESET + 200ms（≥规格 120ms），
+        //    跳过 esp_lcd_panel_reset（其软件复位只等 20ms）。
+        ESP_LOGI(TAG, "[时序] 显示初始化 t=%dms，先等 400ms 让供电/RC 复位稳定", (int)(esp_log_timestamp()));
+        vTaskDelay(pdMS_TO_TICKS(400));
+        esp_lcd_panel_io_tx_param(io_handle, 0x01, NULL, 0);   // 0x01 SWRESET（软复位）
+        vTaskDelay(pdMS_TO_TICKS(200));                         // 规格要求复位后 ≥120ms
+        LogGpio0State("reset后");
         esp_lcd_panel_handle_t panel_handle = nullptr;
         esp_lcd_panel_dev_config_t panel_config = {};
         panel_config.reset_gpio_num = DISPLAY_LEFT_RST_PIN;   // GPIO_NUM_NC（疑似硬件复位）
         panel_config.rgb_endian = LCD_RGB_ENDIAN_BGR;
         panel_config.bits_per_pixel = 16;
         ESP_ERROR_CHECK(esp_lcd_new_panel_gc9a01(io_handle, &panel_config, &panel_handle));
-        ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
-        LogGpio0State("reset后");
+        // 注意：不再调用 esp_lcd_panel_reset —— 其软件复位路径只等 20ms（低于规格 120ms），
+        // SWRESET 已在上面手动发出并等待 200ms。
         ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
         LogGpio0State("init后");
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));   // [已确认] 固件 API 序列
