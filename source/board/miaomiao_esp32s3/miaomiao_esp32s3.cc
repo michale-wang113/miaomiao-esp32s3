@@ -164,6 +164,9 @@ public:
         : boot_button_(BOOT_BUTTON_GPIO),
           second_button_(SECOND_BUTTON_GPIO) {
         InitializeCodecI2c();
+        // [内存时序] 原厂顺序：摄像头先于显示初始化。若 LVGL 先占用 2MB PSRAM 缓存，
+        // 摄像头的 PSRAM DMA 大块连续内存分配会失败（frames malloc failed），故在此预创建。
+        GetCamera();
         InitializeSpi();
         InitializeGc9a01Display();
         InitializeButtons();
