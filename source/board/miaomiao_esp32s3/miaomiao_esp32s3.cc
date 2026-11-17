@@ -307,20 +307,11 @@ private:
                     esp_lcd_panel_draw_bitmap(panel_handle, 0, y, DISPLAY_WIDTH, y + kRows, line);
                     if (y == 0) LogGpio0State("第1行白屏后");
                 }
-                ESP_LOGI(TAG, "[屏幕测试] 白屏保持 5 秒后进入回读/应答实验");
+                ESP_LOGI(TAG, "[屏幕测试] 白屏保持 5 秒后进入命令应答实验");
                 LogGpio0State("白屏后");
                 vTaskDelay(pdMS_TO_TICKS(5000));
 
-                // [决定性实验 A] GRAM 回读：刚刷满 0xFFFF，读回应为 FF
-                {
-                    uint8_t rx[16] = {0};
-                    esp_err_t err = esp_lcd_panel_io_rx_color(io_handle, 0x2E, rx, sizeof(rx));
-                    ESP_LOGI(TAG, "[回读A] err=%s 数据: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-                             esp_err_to_name(err), rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6],
-                             rx[7], rx[8], rx[9], rx[10], rx[11]);
-                }
-
-                // [决定性实验 B] 命令应答：面板是否听我们的命令
+                // [决定性实验] 命令应答：面板是否听我们的命令
                 ESP_LOGI(TAG, "[应答B1] INVON 0x21 → 若面板活着且听命令，深灰应变白（2秒）");
                 esp_lcd_panel_io_tx_param(io_handle, 0x21, nullptr, 0);
                 vTaskDelay(pdMS_TO_TICKS(2000));
@@ -338,19 +329,7 @@ private:
                 esp_lcd_panel_io_tx_param(io_handle, 0x21, nullptr, 0);
                 vTaskDelay(pdMS_TO_TICKS(2000));
 
-                // [决定性实验 C] 重发完整 SLPOUT+初始化后回读 GRAM
-                {
-                    esp_lcd_panel_io_tx_param(io_handle, 0x11, nullptr, 0);  // SLPOUT
-                    vTaskDelay(pdMS_TO_TICKS(150));
-                    esp_lcd_panel_io_tx_param(io_handle, 0x29, nullptr, 0);  // DISPON
-                    esp_lcd_panel_io_tx_param(io_handle, 0x21, nullptr, 0);  // INVON
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                    uint8_t rx[16] = {0};
-                    esp_err_t err = esp_lcd_panel_io_rx_color(io_handle, 0x2E, rx, sizeof(rx));
-                    ESP_LOGI(TAG, "[回读C] SLPOUT+重初始化后 err=%s 数据: %02x %02x %02x %02x %02x %02x %02x %02x",
-                             esp_err_to_name(err), rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
-                }
-                ESP_LOGI(TAG, "[屏幕测试] 实验结束，交还 LVGL");
+                ESP_LOGI(TAG, "[屏幕测试] 应答实验结束，交还 LVGL");
                 heap_caps_free(line);
             } else {
                 ESP_LOGE(TAG, "[屏幕测试] DMA 缓冲分配失败");
