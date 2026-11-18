@@ -76,8 +76,12 @@ def write_sdkconfig_defaults() -> None:
         lines = [l for l in defaults.read_text(encoding="utf-8").splitlines()
                  if "BOARD_TYPE" not in l]
     lines.append(f"CONFIG_BOARD_TYPE_{KCONFIG_NAME.replace('BOARD_TYPE_', '')}=y")
+    # 摄像头修复三件套之一：S3 上让 camera DMA 直接走 PSRAM，
+    # 避免内部 RAM 不足导致 cam_dma_config "frames malloc failed"（vendor 构建同款行为）
+    if "CONFIG_CAMERA_PSRAM_DMA" not in lines:
+        lines.append("CONFIG_CAMERA_PSRAM_DMA=y")
     defaults.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print("[patch] sdkconfig.defaults 已写入默认板型")
+    print("[patch] sdkconfig.defaults 已写入默认板型 + CAMERA_PSRAM_DMA")
 
 
 if __name__ == "__main__":
