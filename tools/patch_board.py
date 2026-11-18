@@ -84,10 +84,67 @@ def write_sdkconfig_defaults() -> None:
     print("[patch] sdkconfig.defaults 已写入默认板型 + CAMERA_PSRAM_DMA")
 
 
+def patch_display_preview() -> None:
+    """预览图全屏化：拍照/preview_image 显示时铺满整个圆屏（cover 裁边、居中）。
+    上游 v2.2.2 默认只显示 70%×50% 气泡小图（缩放上限 100%、左对齐），
+    在 GC9A01 圆屏上表现为"照片缩在屏幕中间一小块"。
+    锚点字符串已对 78/xiaozhi-esp32 v2.2.2 的 lcd_display.cc 逐字节校验。"""
+    lcd = root / "main" / "display" / "lcd_display.cc"
+    if not lcd.exists():
+        print("[patch] 未找到 main/display/lcd_display.cc，跳过预览图补丁")
+        return
+    text = lcd.read_text(encoding="utf-8")
+    if "[miaomiao-fullscreen-preview]" in text:
+        print("[patch] 预览图补丁已应用，跳过")
+        return
+    reps = [
+        (
+            "lv_obj_set_style_pad_all(img_bubble, lvgl_theme->spacing(4), 0);",
+            "lv_obj_set_style_pad_all(img_bubble, 0, 0);  // [miaomiao-fullscreen-preview]",
+        ),
+        (
+            "lv_coord_t max_width = LV_HOR_RES * 70 / 100;  // 70% of screen width",
+            "lv_coord_t max_width = LV_HOR_RES;  // [miaomiao-fullscreen-preview] 铺满整屏",
+        ),
+        (
+            "lv_coord_t max_height = LV_VER_RES * 50 / 100; // 50% of screen height",
+            "lv_coord_t max_height = LV_VER_RES;  // [miaomiao-fullscreen-preview]",
+        ),
+        (
+            "lv_coord_t zoom = (zoom_w < zoom_h) ? zoom_w : zoom_h;",
+            "lv_coord_t zoom = (zoom_w > zoom_h) ? zoom_w : zoom_h;  // [miaomiao-fullscreen-preview] cover 模式",
+        ),
+        (
+            "    // Ensure zoom doesn't exceed 256 (100%)\n    if (zoom > 256) zoom = 256;\n",
+            "    // [miaomiao-fullscreen-preview] 解除 100% 缩放上限，小图允许放大铺满圆屏\n",
+        ),
+        (
+            "    lv_obj_set_width(img_bubble, scaled_width + 16);\n"
+            "    lv_obj_set_height(img_bubble, scaled_height + 16);",
+            "    lv_obj_set_width(img_bubble, max_width);   // [miaomiao-fullscreen-preview]\n"
+            "    lv_obj_set_height(img_bubble, max_height);\n"
+            "    lv_obj_remove_flag(img_bubble, LV_OBJ_FLAG_SCROLLABLE);  // 裁掉超出圆屏的部分",
+        ),
+        (
+            "lv_obj_align(img_bubble, LV_ALIGN_LEFT_MID, 0, 0);",
+            "lv_obj_align(img_bubble, LV_ALIGN_CENTER, 0, 0);  // [miaomiao-fullscreen-preview]",
+        ),
+    ]
+    for old, new in reps:
+        n = text.count(old)
+        if n != 1:
+            print(f"[patch] ⚠️ 预览图补丁锚点命中 {n} 次（期望 1），中止: {old[:60]!r}")
+            return
+        text = text.replace(old, new)
+    lcd.write_text(text, encoding="utf-8")
+    print("[patch] lcd_display.cc 预览图已改为全屏 cover 模式")
+
+
 if __name__ == "__main__":
     ok = patch_kconfig()
     patch_cmake()
     write_sdkconfig_defaults()
+    patch_display_preview()
     if not (root / "main" / "boards" / BOARD_DIR).exists():
         print(f"[patch] ⚠️ 尚未复制板目录: cp -r source/board/{BOARD_DIR} main/boards/{BOARD_DIR}")
     print("[patch] 完成。下一步: idf.py set-target esp32s3 && idf.py build")
