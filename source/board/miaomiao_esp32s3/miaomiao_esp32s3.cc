@@ -182,6 +182,8 @@ public:
         : boot_button_(BOOT_BUTTON_GPIO),
           second_button_(SECOND_BUTTON_GPIO) {
         InitializeCodecI2c();
+        GetCamera();            // 摄像头修复三件套之二：预创建先于显示初始化
+                                //（vendor 日志铁证：cam init 先于显示，PSRAM frame buffer 先占坑）
         InitializeSpi();
         InitializeGc9a01Display();
         InitializeButtons();
@@ -241,6 +243,8 @@ public:
         cfg.frame_size   = FRAMESIZE_QVGA;
         cfg.fb_location  = CAMERA_FB_IN_PSRAM;  // N16R8 有 8MB PSRAM
         cfg.grab_mode    = CAMERA_GRAB_LATEST;
+        cfg.fb_count     = 2;   // 摄像头修复三件套之三：零初始化漏设会导致
+                                // cam_hal frame_cnt=0 → calloc(0)=NULL → "frames malloc failed"
         return cfg;
     }
 
