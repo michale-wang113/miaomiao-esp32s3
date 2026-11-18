@@ -81,7 +81,7 @@ private:
     }
 
     void InitializeGc9a01Display() {
-        // [已确认] 两屏并联：同总线同 CS(GPIO47) 同 DC(GPIO0)，同步显示
+        // [已确认] 两屏并联：同总线同 CS(GPIO47) 同 DC(GPIO48)，RST=GPIO0，同步显示
         esp_lcd_panel_io_handle_t io_handle = nullptr;
         esp_lcd_panel_io_spi_config_t io_config = {};
         io_config.cs_gpio_num = DISPLAY_LEFT_CS_PIN;
@@ -95,7 +95,7 @@ private:
 
         esp_lcd_panel_handle_t panel_handle = nullptr;
         esp_lcd_panel_dev_config_t panel_config = {};
-        panel_config.reset_gpio_num = DISPLAY_LEFT_RST_PIN;   // GPIO_NUM_NC（疑似硬件复位）
+        panel_config.reset_gpio_num = DISPLAY_LEFT_RST_PIN;   // GPIO_NUM_0（vendor 反汇编实锤：GPIO0 作硬件复位线）
         panel_config.rgb_endian = LCD_RGB_ENDIAN_BGR;
         panel_config.bits_per_pixel = 16;
         ESP_ERROR_CHECK(esp_lcd_new_panel_gc9a01(io_handle, &panel_config, &panel_handle));
