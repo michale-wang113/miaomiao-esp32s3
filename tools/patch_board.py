@@ -94,7 +94,8 @@ def patch_display_preview() -> None:
         print("[patch] 未找到 main/display/lcd_display.cc，跳过预览图补丁")
         return
     text = lcd.read_text(encoding="utf-8")
-    if "[miaomiao-fullscreen-preview]" in text and "[miaomiao-bars-transparent]" in text:
+    if ("[miaomiao-fullscreen-preview]" in text and "[miaomiao-bars-transparent]" in text
+            and "[miaomiao-hide-bars-on-preview]" in text):
         print("[patch] 预览图补丁已应用，跳过")
         return
     reps = [
@@ -182,6 +183,57 @@ def patch_display_preview() -> None:
         (
             "        lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_50, 0);",
             "        lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_TRANSP, 0);  // [miaomiao-bars-transparent]",
+        ),
+        # ---- 预览期间隐藏三栏（[miaomiao-hide-bars-on-preview]）----
+        # 2026-11-19 ELF 反汇编证实透明化已编译但用户仍见"白块"：50% 白叠在浅色照片上
+        # 与全透明视觉几乎无差别。改为预览显示期间直接隐藏 top_bar_/status_bar_/bottom_bar_，
+        # 照片全屏零遮挡；预览结束（定时器回调 SetPreviewImage(nullptr)）恢复三栏。
+        # 锚点唯一性：#if 分支 SetPreviewImage 为 "if (image == nullptr) { return; }" 结构，与此不同。
+        (
+            "    // Hide emoji_box_\n"
+            "    if (gif_controller_) {\n"
+            "        gif_controller_->Stop();\n"
+            "    }\n"
+            "    lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);\n"
+            "    lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);",
+            "    // Hide emoji_box_\n"
+            "    if (gif_controller_) {\n"
+            "        gif_controller_->Stop();\n"
+            "    }\n"
+            "    lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);\n"
+            "    lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);\n"
+            "    // [miaomiao-hide-bars-on-preview] 预览期间隐藏三栏，照片全屏无遮挡\n"
+            "    if (top_bar_ != nullptr) {\n"
+            "        lv_obj_add_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);\n"
+            "    }\n"
+            "    if (status_bar_ != nullptr) {\n"
+            "        lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);\n"
+            "    }\n"
+            "    if (bottom_bar_ != nullptr) {\n"
+            "        lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);\n"
+            "    }",
+        ),
+        (
+            "    if (image == nullptr) {\n"
+            "        esp_timer_stop(preview_timer_);\n"
+            "        lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);\n"
+            "        lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);\n"
+            "        preview_image_cached_.reset();",
+            "    if (image == nullptr) {\n"
+            "        esp_timer_stop(preview_timer_);\n"
+            "        lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);\n"
+            "        lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);\n"
+            "        // [miaomiao-hide-bars-on-preview] 预览结束恢复三栏\n"
+            "        if (top_bar_ != nullptr) {\n"
+            "            lv_obj_remove_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);\n"
+            "        }\n"
+            "        if (status_bar_ != nullptr) {\n"
+            "            lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);\n"
+            "        }\n"
+            "        if (bottom_bar_ != nullptr) {\n"
+            "            lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);\n"
+            "        }\n"
+            "        preview_image_cached_.reset();",
         ),
     ]
     for old, new in reps:
