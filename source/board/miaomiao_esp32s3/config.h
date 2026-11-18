@@ -78,7 +78,9 @@
 
 // 像素时钟
 #define DISPLAY_PIXEL_CLOCK_HZ  (40 * 1000 * 1000)
-#define DISPLAY_MIRROR_X false
+// LVGL 层旋转参数（vendor 反汇编实锤 2026-11-18：SpiLcdDisplay 构造传入 mirror_x=true）
+// 面板层 esp_lcd_panel_mirror(true,false) + LVGL 层 mirror_x=true 双重翻转 = 正常方向
+#define DISPLAY_MIRROR_X true
 #define DISPLAY_MIRROR_Y false
 #define DISPLAY_SWAP_XY  false
 
