@@ -59,17 +59,18 @@
 #define DISPLAY_MISO_PIN        GPIO_NUM_NC   // 一般不用，置 NC
 
 // 两屏并联驱动（同总线同 CS 同 DC，同时写入相同内容——表情双眼同步显示）
+// 2026-11-18 objdump 反汇编 vendor 固件铁证：DC=GPIO48, RST=GPIO0（vendor 经
+// esp_lcd_panel_reset 驱动）。GPIO34-48 走 IOMUX 不经 GPIO 矩阵，JTAG 矩阵扫描看不到
 #define DISPLAY_LEFT_CS_PIN     GPIO_NUM_47   // [已确认] GPIO 矩阵实测 SPI3 CS0
-#define DISPLAY_LEFT_DC_PIN     GPIO_NUM_0    // [高置信推断] 全机唯一空闲 GPIO 输出，
-                                              //  空闲电平高（DC 常态），两屏共用
-#define DISPLAY_LEFT_RST_PIN    GPIO_NUM_NC   // [待确认] 疑似硬件拉高/RC 复位
-#define DISPLAY_LEFT_BL_PIN     GPIO_NUM_NC   // [待确认] 疑似硬件常亮
+#define DISPLAY_LEFT_DC_PIN     GPIO_NUM_48   // [已确认] vendor io_config.dc_gpio_num=48
+#define DISPLAY_LEFT_RST_PIN    GPIO_NUM_0    // [已确认] vendor panel_config.reset_gpio_num=0
+#define DISPLAY_LEFT_BL_PIN     GPIO_NUM_NC   // [已确认] vendor GetBacklight() 为空，硬件常亮
 
 // 右眼与左眼完全并联
 #define DISPLAY_RIGHT_CS_PIN    GPIO_NUM_47   // [已确认] 共用 CS
-#define DISPLAY_RIGHT_DC_PIN    GPIO_NUM_0    // [已确认] 共用 DC
-#define DISPLAY_RIGHT_RST_PIN   GPIO_NUM_NC   // [待确认]
-#define DISPLAY_RIGHT_BL_PIN    GPIO_NUM_NC   // [待确认]
+#define DISPLAY_RIGHT_DC_PIN    GPIO_NUM_48   // [已确认] 共用 DC=48
+#define DISPLAY_RIGHT_RST_PIN   GPIO_NUM_0    // [已确认] 共用 RST=GPIO0
+#define DISPLAY_RIGHT_BL_PIN    GPIO_NUM_NC   // [已确认] 硬件常亮
 
 // 背光：未发现控制脚，疑似硬件常亮
 #define DISPLAY_BACKLIGHT_PIN   GPIO_NUM_NC   // [待确认]
