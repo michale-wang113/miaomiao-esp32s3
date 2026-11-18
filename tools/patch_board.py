@@ -76,49 +76,14 @@ def write_sdkconfig_defaults() -> None:
         lines = [l for l in defaults.read_text(encoding="utf-8").splitlines()
                  if "BOARD_TYPE" not in l]
     lines.append(f"CONFIG_BOARD_TYPE_{KCONFIG_NAME.replace('BOARD_TYPE_', '')}=y")
-    # [屏幕回退实验] 暂时移除 CAMERA_PSRAM_DMA 注入（嫌疑：该配置改 DMA/缓存行为导致显示乱码）
-    # if "CAMERA_PSRAM_DMA" not in lines:
-    #     lines.append("CONFIG_CAMERA_PSRAM_DMA=y")
     defaults.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("[patch] sdkconfig.defaults 已写入默认板型")
-
-
-def patch_lcd_display_dc_track() -> None:
-    """[Debug] 在 SpiLcdDisplay 构造各阶段插入 GPIO0(DC) 输出使能/电平跟踪日志。"""
-    lcd = root / "main" / "display" / "lcd_display.cc"
-    if not lcd.exists():
-        print("[patch] 未找到 main/display/lcd_display.cc，跳过 DC-TRACK")
-        return
-    text = lcd.read_text(encoding="utf-8")
-    if "DC-TRACK" in text:
-        print("[patch] lcd_display.cc 已含 DC-TRACK，跳过")
-        return
-    LOG = ('    ESP_LOGI(TAG, "[DC-TRACK] {name} OE=%d LVL=%d", '
-           '(*(volatile uint32_t*)0x60004020) & 1, (*(volatile uint32_t*)0x60004004) & 1);\n')
-    marks = [
-        ("    // Set the display to on", "SpiLcd白屏后"),
-        ('    ESP_LOGI(TAG, "Initialize LVGL library");', "SpiLcd disp_on后"),
-        ('    ESP_LOGI(TAG, "Initialize LVGL port");', "SpiLcd lv_init后"),
-        ('    ESP_LOGI(TAG, "Adding LCD display");', "SpiLcd port_init后"),
-        ("    SetupUI();", "SpiLcd add_disp后"),
-    ]
-    count = 0
-    for marker, name in marks:
-        idx = text.find(marker)
-        if idx < 0:
-            print(f"[patch] DC-TRACK 未找到标记: {marker.strip()}")
-            continue
-        text = text[:idx] + LOG.format(name=name) + text[idx:]
-        count += 1
-    lcd.write_text(text, encoding="utf-8")
-    print(f"[patch] lcd_display.cc 已插入 {count} 处 DC-TRACK 日志")
 
 
 if __name__ == "__main__":
     ok = patch_kconfig()
     patch_cmake()
     write_sdkconfig_defaults()
-    patch_lcd_display_dc_track()
     if not (root / "main" / "boards" / BOARD_DIR).exists():
         print(f"[patch] ⚠️ 尚未复制板目录: cp -r source/board/{BOARD_DIR} main/boards/{BOARD_DIR}")
     print("[patch] 完成。下一步: idf.py set-target esp32s3 && idf.py build")
