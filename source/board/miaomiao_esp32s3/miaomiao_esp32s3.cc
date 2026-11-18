@@ -19,11 +19,6 @@
 #include <esp_log.h>
 #include <esp_mac.h>
 #include <esp_heap_caps.h>
-#include <esp_cpu.h>
-#include <atomic>
-#include <cmath>
-#include <cstring>
-#include <algorithm>
 #include <cstdio>
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
@@ -44,48 +39,6 @@
 #include "servo_controller.h"
 
 extern void RegisterServoTools();
-
-// ============================================================
-// [Debug] GPIO0(DC) 输出使能哨兵 — 排查屏幕乱码（DC 被人改成输入）
-//   EN0  = GPIO_ENABLE_REG    @0x60004020 (bit0 = GPIO0 输出使能)
-//   OUT0 = GPIO_OUT_REG       @0x60004004 (bit0 = GPIO0 电平)
-//   W1TC = GPIO_ENABLE_W1TC   @0x6000402C (写 1 清除输出使能)
-//   MUX  = IO_MUX GPIO0       @0x60009004
-// ============================================================
-static uint32_t RegRd32(uint32_t addr) { return *(volatile uint32_t*)addr; }
-
-static void LogGpio0State(const char* where) {
-    uint32_t en0  = RegRd32(0x60004020);
-    uint32_t out0 = RegRd32(0x60004004);
-    uint32_t mux  = RegRd32(0x60009004);
-    ESP_LOGI("Board", "[DC-TRACK] %-14s OE=%d LVL=%d EN0=0x%08x MUX0=0x%08x",
-             where, (int)(en0 & 1), (int)((out0 >> 0) & 1), en0, mux);
-}
-
-static void Gpio0WatchpointTask(void* arg) {
-    // 对 GPIO_ENABLE_W1TC 的任何写 = 有人在关 0-31 号脚的输出使能 → panic 留下调用栈
-    esp_err_t err = esp_cpu_set_watchpoint(0, (const void*)0x6000402C, 4, ESP_CPU_WATCHPOINT_STORE);
-    ESP_LOGI("Board", "[哨兵] CPU%d 观察点安装: %s", (int)xPortGetCoreID(), esp_err_to_name(err));
-    vTaskDelete(nullptr);
-}
-
-static void Gpio0SentinelTask(void* arg) {
-    // 注意：pdMS_TO_TICKS 在 HZ=100 下会把小毫秒数整除成 0（死循环饿死主任务），故用裸 tick
-    int last_oe = -1, last_lvl = -1;
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(40000);
-    while (xTaskGetTickCount() < deadline) {
-        int oe  = (int)(RegRd32(0x60004020) & 1);
-        int lvl = (int)(RegRd32(0x60004004) & 1);
-        if (last_oe >= 0 && (oe != last_oe || lvl != last_lvl)) {
-            ESP_LOGW("Board", "[DC-TRACK] 翻转! OE %d->%d LVL %d->%d", last_oe, oe, last_lvl, lvl);
-        }
-        last_oe = oe;
-        last_lvl = lvl;
-        vTaskDelay(1);   // 1 tick（10ms），不饿死主任务
-    }
-    ESP_LOGI("Board", "[哨兵] 40 秒监视结束");
-    vTaskDelete(nullptr);
-}
 extern void RegisterDisplayTools();
 
 #define TAG "MiaoMiaoBoard"
@@ -97,125 +50,6 @@ private:
     Display* display_ = nullptr;
     i2c_master_bus_handle_t codec_i2c_bus_ = nullptr;
     adc_oneshot_unit_handle_t battery_adc_handle_ = nullptr;
-
-    // —— 语音备忘录（双按键：按一下录音，再按一下回放）——
-    std::atomic<bool> memo_recording_{false};
-    std::atomic<bool> memo_playing_{false};
-    std::atomic<bool> memo_stop_{false};
-    int16_t* memo_buffer_ = nullptr;                       // PSRAM
-    size_t memo_len_ = 0;                                  // 已录采样数
-    static constexpr size_t kMemoSampleRate = 24000;       // 与 codec 输入/输出同率，免重采样
-    static constexpr size_t kMemoMaxSeconds = 60;
-    static constexpr size_t kMemoMaxSamples = kMemoSampleRate * kMemoMaxSeconds;
-
-    void PlayTone(int freq_hz, int ms, int amp = 6000) {
-        auto codec = GetAudioCodec();
-        codec->EnableOutput(true);
-        vTaskDelay(pdMS_TO_TICKS(30));
-        const int kChunk = 240;
-        int total = (int)kMemoSampleRate * ms / 1000;
-        for (int i = 0; i < total; i += kChunk) {
-            std::vector<int16_t> seg;
-            seg.reserve(kChunk);
-            for (int j = 0; j < kChunk && i + j < total; j++) {
-                int n = i + j;
-                float env = std::min(1.0f, std::min((float)n / (total * 0.15f),
-                                                    (float)(total - n) / (total * 0.15f)));
-                seg.push_back((int16_t)(amp * env * sinf(2.0f * (float)M_PI * freq_hz * n / kMemoSampleRate)));
-            }
-            codec->OutputData(seg);
-        }
-    }
-
-    void VoiceMemoTask() {
-        auto& audio = Application::GetInstance().GetAudioService();
-        auto codec = GetAudioCodec();
-
-        // 录音期间暂停唤醒词检测，独占麦克风输入
-        audio.EnableWakeWordDetection(false);
-        vTaskDelay(pdMS_TO_TICKS(120));
-
-        // 提示音：一声短哔 = 开始录音
-        PlayTone(880, 150);
-
-        size_t silence_frames = 0;
-        std::vector<int16_t> chunk;
-        memo_len_ = 0;
-        while (memo_len_ < kMemoMaxSamples) {
-            chunk.assign(1024, 0);
-            if (!audio.ReadAudioData(chunk, kMemoSampleRate, 1024)) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-            memcpy(memo_buffer_ + memo_len_, chunk.data(),
-                   std::min(chunk.size(), kMemoMaxSamples - memo_len_) * sizeof(int16_t));
-            memo_len_ += std::min(chunk.size(), kMemoMaxSamples - memo_len_);
-            if (memo_stop_.load()) break;
-            // 静音自动截断：连续 3 秒无声提前结束录音
-            int64_t energy = 0;
-            for (size_t i = 0; i < chunk.size(); i += 16) energy += abs(chunk[i]);
-            if (energy / (chunk.size() / 16 + 1) < 60) {
-                if (++silence_frames >= kMemoSampleRate / 1024 * 3) break;
-            } else {
-                silence_frames = 0;
-            }
-        }
-        memo_recording_ = false;
-
-        ESP_LOGI(TAG, "[备忘录] 录音结束：%.1f 秒，开始回放", (float)memo_len_ / kMemoSampleRate);
-        vTaskDelay(pdMS_TO_TICKS(150));
-
-        // 回放
-        memo_playing_ = true;
-        codec->EnableOutput(true);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        const size_t kPlayChunk = 960;
-        for (size_t pos = 0; pos < memo_len_; pos += kPlayChunk) {
-            size_t n = std::min(kPlayChunk, memo_len_ - pos);
-            std::vector<int16_t> out(memo_buffer_ + pos, memo_buffer_ + pos + n);
-            codec->OutputData(out);
-        }
-        // 结束提示音：两声短哔
-        PlayTone(1320, 120);
-        PlayTone(1320, 120);
-        codec->EnableOutput(false);
-        memo_playing_ = false;
-
-        // 恢复唤醒词
-        audio.EnableWakeWordDetection(true);
-        ESP_LOGI(TAG, "[备忘录] 回放完成");
-        vTaskDelete(nullptr);
-    }
-
-    static void VoiceMemoTaskEntry(void* arg) {
-        static_cast<MiaoMiaoESP32S3*>(arg)->VoiceMemoTask();
-    }
-
-    void ToggleVoiceMemo() {
-        if (memo_recording_.load()) {
-            // 第二次按下：停止录音 → 回放
-            memo_stop_ = true;
-            return;
-        }
-        if (memo_playing_.load()) {
-            return;  // 回放中忽略按键
-        }
-        // 空闲状态：开始录音
-        if (!memo_buffer_) {
-            memo_buffer_ = (int16_t*)heap_caps_malloc(
-                kMemoMaxSamples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-            if (!memo_buffer_) {
-                ESP_LOGE(TAG, "[备忘录] PSRAM 缓冲分配失败（%d 字节）", (int)(kMemoMaxSamples * 2));
-                return;
-            }
-        }
-        memo_stop_ = false;
-        memo_recording_ = true;
-        ESP_LOGI(TAG, "[备忘录] 开始录音（GPIO43/44 再按一次回放，最长 60 秒）");
-        if (xTaskCreate(&MiaoMiaoESP32S3::VoiceMemoTaskEntry, "VoiceMemo", 6144, this, 4, nullptr) != pdPASS) {
-            memo_recording_ = false;
-        }
-    }
 
     void InitializeCodecI2c() {
         // [已确认] codec 控制口 I2C0：SDA=GPIO1, SCL=GPIO2（JTAG 实测）
@@ -247,19 +81,6 @@ private:
     }
 
     void InitializeGc9a01Display() {
-        // [复刻 vendor] GPIO0(DC) IO_MUX 清除 FUN_WPU(bit8)+FUN_IE(bit9)：
-        // JTAG 对比唯一剩余寄存器差异（vendor=0x1802, ours=0x1b02）
-        {
-            uint32_t mux_before = RegRd32(0x60009004);
-            *(volatile uint32_t*)0x60009004 = mux_before & ~0x300u;
-            ESP_LOGI(TAG, "[DC-MUX] GPIO0 IO_MUX 0x%08x → 0x%08x (复刻 vendor: 无上拉/无输入使能)",
-                     mux_before, RegRd32(0x60009004));
-        }
-        // [Debug] 双核各装 GPIO_ENABLE_W1TC 写观察点 + 1ms 哨兵任务
-        xTaskCreatePinnedToCore(Gpio0WatchpointTask, "wp0", 3072, nullptr, 20, nullptr, 0);
-        xTaskCreatePinnedToCore(Gpio0WatchpointTask, "wp1", 3072, nullptr, 20, nullptr, 1);
-        xTaskCreate(Gpio0SentinelTask, "gpio0sent", 4096, nullptr, 15, nullptr);
-
         // [已确认] 两屏并联：同总线同 CS(GPIO47) 同 DC(GPIO0)，同步显示
         esp_lcd_panel_io_handle_t io_handle = nullptr;
         esp_lcd_panel_io_spi_config_t io_config = {};
@@ -271,41 +92,20 @@ private:
         io_config.lcd_cmd_bits = 8;
         io_config.lcd_param_bits = 8;
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(DISPLAY_SPI_HOST, &io_config, &io_handle));
-        LogGpio0State("panel_io后");
 
-        // [时序修复实验] 上电竞态假设：
-        //  - 本板无软件复位线（RST=NC，走硬件 RC 复位），面板复位释放时刻不受控；
-        //  - 冷启动时电池升压电路 + RC 复位可能未稳，t≈250ms 即发命令易被欠压面板吞掉
-        //    → GRAM 随机 → 彩虹条纹；热复位（面板已供电）则成功 —— 与"时好时坏"吻合；
-        //  - 组件默认时序低于 GC9A01 规格：SWRESET 后等 20ms（规格 120ms）、
-        //    SLPOUT 后等 100ms（规格 120ms）；
-        //  - 修复：先给 400ms 供电稳定延时，再手动 SWRESET + 200ms（≥规格 120ms），
-        //    跳过 esp_lcd_panel_reset（其软件复位只等 20ms）。
-        ESP_LOGI(TAG, "[时序] 显示初始化 t=%dms，先等 400ms 让供电/RC 复位稳定", (int)(esp_log_timestamp()));
-        vTaskDelay(pdMS_TO_TICKS(400));
-        esp_lcd_panel_io_tx_param(io_handle, 0x01, NULL, 0);   // 0x01 SWRESET（软复位）
-        vTaskDelay(pdMS_TO_TICKS(200));                         // 规格要求复位后 ≥120ms
-        LogGpio0State("reset后");
         esp_lcd_panel_handle_t panel_handle = nullptr;
         esp_lcd_panel_dev_config_t panel_config = {};
         panel_config.reset_gpio_num = DISPLAY_LEFT_RST_PIN;   // GPIO_NUM_NC（疑似硬件复位）
         panel_config.rgb_endian = LCD_RGB_ENDIAN_BGR;
         panel_config.bits_per_pixel = 16;
         ESP_ERROR_CHECK(esp_lcd_new_panel_gc9a01(io_handle, &panel_config, &panel_handle));
-        // 注意：不再调用 esp_lcd_panel_reset —— 其软件复位路径只等 20ms（低于规格 120ms），
-        // SWRESET 已在上面手动发出并等待 200ms。
+        ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
         ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
-        LogGpio0State("init后");
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));   // [已确认] 固件 API 序列
-        LogGpio0State("invert后");
         ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false));  // [已确认]
-        LogGpio0State("mirror后");
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
-        LogGpio0State("disp_on后");
 
-        // [屏幕对照实验] 绕过 LVGL 直接刷白屏 3 秒：
-        // 白屏可见 = panel/SPI/DC 写入链路通 → 黑屏问题在渲染层；
-        // 白屏不可见 = 本固件配置下 SPI 写入到不了面板 → 配置回归
+        // [屏幕诊断] 绕过 LVGL 直接刷白屏 3 秒：白屏=panel/SPI/DC 链路通，问题在渲染层；黑屏=面板初始化问题
         {
             const int kRows = 16;
             uint16_t* line = (uint16_t*)heap_caps_malloc(DISPLAY_WIDTH * kRows * sizeof(uint16_t), MALLOC_CAP_DMA);
@@ -313,25 +113,9 @@ private:
                 for (int i = 0; i < DISPLAY_WIDTH * kRows; i++) line[i] = 0xFFFF;
                 for (int y = 0; y < DISPLAY_HEIGHT; y += kRows) {
                     esp_lcd_panel_draw_bitmap(panel_handle, 0, y, DISPLAY_WIDTH, y + kRows, line);
-                    if (y == 0) LogGpio0State("第1行白屏后");
                 }
-                ESP_LOGI(TAG, "[屏幕测试] 白屏保持 5 秒后进入白黑交替闪烁（60 秒，每 3 秒切换）");
-                LogGpio0State("白屏后");
-                vTaskDelay(pdMS_TO_TICKS(5000));
-                // [极简实验] 白黑交替闪烁 10 轮：屏幕只要在切换点变化 = 面板活着听命令
-                for (int cyc = 0; cyc < 10; cyc++) {
-                    for (int i = 0; i < DISPLAY_WIDTH * kRows; i++) line[i] = 0xFFFF;
-                    for (int y = 0; y < DISPLAY_HEIGHT; y += kRows)
-                        esp_lcd_panel_draw_bitmap(panel_handle, 0, y, DISPLAY_WIDTH, y + kRows, line);
-                    ESP_LOGI(TAG, "[闪烁] 第 %d 轮 → 白", cyc + 1);
-                    vTaskDelay(pdMS_TO_TICKS(3000));
-                    for (int i = 0; i < DISPLAY_WIDTH * kRows; i++) line[i] = 0x0000;
-                    for (int y = 0; y < DISPLAY_HEIGHT; y += kRows)
-                        esp_lcd_panel_draw_bitmap(panel_handle, 0, y, DISPLAY_WIDTH, y + kRows, line);
-                    ESP_LOGI(TAG, "[闪烁] 第 %d 轮 → 黑", cyc + 1);
-                    vTaskDelay(pdMS_TO_TICKS(3000));
-                }
-                ESP_LOGI(TAG, "[屏幕测试] 闪烁实验结束，交还 LVGL");
+                ESP_LOGI(TAG, "[屏幕测试] 白屏已发送，3 秒后交还 LVGL");
+                vTaskDelay(pdMS_TO_TICKS(3000));
                 heap_caps_free(line);
             } else {
                 ESP_LOGE(TAG, "[屏幕测试] DMA 缓冲分配失败");
@@ -342,24 +126,17 @@ private:
                                      DISPLAY_WIDTH, DISPLAY_HEIGHT,
                                      0, 0,                 // offset_x / offset_y
                                      DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
-        LogGpio0State("SpiLcdDisplay后");
     }
 
     void InitializeButtons() {
         // [已确认] 双按键 GPIO43/44（固件字符串 + 电平实测）
-        // 新功能：按一下录音，再按一下回放（语音备忘录）
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
                 return;
             }
-            if (app.GetDeviceState() != kDeviceStateIdle) {
-                // 对话/播放等非空闲状态：先退出当前状态
-                app.ToggleChatState();
-                return;
-            }
-            ToggleVoiceMemo();
+            app.ToggleChatState();
         });
         boot_button_.OnLongPress([this]() {
             // 与原厂一致：长按显示 MAC 地址界面
@@ -369,12 +146,7 @@ private:
             }
         });
         second_button_.OnClick([this]() {
-            auto& app = Application::GetInstance();
-            if (app.GetDeviceState() != kDeviceStateIdle) {
-                app.ToggleChatState();
-                return;
-            }
-            ToggleVoiceMemo();
+            Application::GetInstance().ToggleChatState();
         });
     }
 
@@ -410,19 +182,11 @@ public:
         : boot_button_(BOOT_BUTTON_GPIO),
           second_button_(SECOND_BUTTON_GPIO) {
         InitializeCodecI2c();
-        // [屏幕回退实验] 摄像头恢复懒加载（屏幕正常时的原顺序）；fb_count=2 已修复分配问题，
-        // 预初始化不再必要。若屏幕恢复 → 嫌疑锁定为摄像头预初始化/PSRAM_DMA。
-        ESP_LOGI(TAG, "[内存] 显示初始化前 largest DMA=%u free DMA=%u PSRAM free=%u",
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         InitializeSpi();
         InitializeGc9a01Display();
-        // [极简实验] 按用户要求：电机/按键/摄像头全部停用，只留屏幕+音频
-        // InitializeButtons();
-        // InitializeServo();
+        InitializeButtons();
+        InitializeServo();
         InitializeTools();
-        LogGpio0State("工具后");
         // 背光疑似硬件常亮（DISPLAY_BACKLIGHT_PIN=NC），无需 RestoreBrightness
     }
 
@@ -475,19 +239,15 @@ public:
         cfg.xclk_freq_hz = CAMERA_XCLK_FREQ_HZ;
         cfg.pixel_format = PIXFORMAT_RGB565;
         cfg.frame_size   = FRAMESIZE_QVGA;
-        cfg.fb_count     = 2;                   // [关键修复] 缺省为 0 会导致 frame_cnt=0，calloc(0)=NULL → frames malloc failed
         cfg.fb_location  = CAMERA_FB_IN_PSRAM;  // N16R8 有 8MB PSRAM
         cfg.grab_mode    = CAMERA_GRAB_LATEST;
         return cfg;
     }
 
     virtual Camera* GetCamera() override {
-        // [诊断实验] 暂时禁用摄像头初始化：若显示恢复 → 摄像头初始化就是显示破坏真凶
-        ESP_LOGW(TAG, "[诊断] 摄像头初始化已跳过（显示排查实验）");
-        return nullptr;
         // 注册后官方 AddCommonTools 自带 self.camera.take_photo（拍照识物）
-        // static Esp32Camera camera(CameraConfig());
-        // return &camera;
+        static Esp32Camera camera(CameraConfig());
+        return &camera;
     }
 
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
