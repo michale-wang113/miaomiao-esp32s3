@@ -129,6 +129,25 @@ def patch_display_preview() -> None:
             "lv_obj_align(img_bubble, LV_ALIGN_LEFT_MID, 0, 0);",
             "lv_obj_align(img_bubble, LV_ALIGN_CENTER, 0, 0);  // [miaomiao-fullscreen-preview]",
         ),
+        # ---- 非微信样式分支（#else，CONFIG_USE_WECHAT_MESSAGE_STYLE 关闭时编译这套）----
+        # 该分支预览用固定成员 preview_image_：创建时写死半屏居中，缩放公式 128*width_/w（仅 50%）
+        # ——这才是 miaomiao 构建实际编译的分支（2026-11-19 修正）
+        (
+            "lv_obj_set_size(preview_image_, width_ / 2, height_ / 2);",
+            "lv_obj_set_size(preview_image_, width_, height_);  // [miaomiao-fullscreen-preview] 整屏",
+        ),
+        (
+            "    if (img_dsc->header.w > 0 && img_dsc->header.h > 0) {\n"
+            "        // zoom factor 0.5\n"
+            "        lv_image_set_scale(preview_image_, 128 * width_ / img_dsc->header.w);\n"
+            "    }",
+            "    if (img_dsc->header.w > 0 && img_dsc->header.h > 0) {\n"
+            "        // [miaomiao-fullscreen-preview] cover 模式：短边铺满整屏，超出部分被屏幕边缘裁掉\n"
+            "        int scale_w = 256 * width_ / img_dsc->header.w;\n"
+            "        int scale_h = 256 * height_ / img_dsc->header.h;\n"
+            "        lv_image_set_scale(preview_image_, scale_w > scale_h ? scale_w : scale_h);\n"
+            "    }",
+        ),
     ]
     for old, new in reps:
         n = text.count(old)
