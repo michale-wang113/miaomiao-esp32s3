@@ -94,7 +94,7 @@ def patch_display_preview() -> None:
         print("[patch] 未找到 main/display/lcd_display.cc，跳过预览图补丁")
         return
     text = lcd.read_text(encoding="utf-8")
-    if "[miaomiao-fullscreen-preview]" in text:
+    if "[miaomiao-fullscreen-preview]" in text and "[miaomiao-bars-transparent]" in text:
         print("[patch] 预览图补丁已应用，跳过")
         return
     reps = [
@@ -147,6 +147,41 @@ def patch_display_preview() -> None:
             "        int scale_h = 256 * height_ / img_dsc->header.h;\n"
             "        lv_image_set_scale(preview_image_, scale_w > scale_h ? scale_w : scale_h);\n"
             "    }",
+        ),
+        # ---- 状态栏/底栏透明化（[miaomiao-bars-transparent]）----
+        # 现象：预览图全屏后，顶部 top_bar_ 的 50% 半透明背景（LV_OPA_50）盖在照片上，
+        # 在"说话中"等状态文字周围形成一块泛白方块（2026-11-19 用户照片实锤）。
+        # 普通界面下这些栏与主题背景同色，改全透明后观感完全不变；仅预览时不再挡照片。
+        # 锚点唯一性：#if 微信样式分支的 top_bar_ 挂在 container_ 上（lv_obj_create(container_)），
+        # 这里用 lv_obj_create(screen) 锁定 #else 分支；SetTheme 处的替换带 8 空格缩进且无行尾注释，唯一。
+        (
+            "    top_bar_ = lv_obj_create(screen);\n"
+            "    lv_obj_set_size(top_bar_, LV_HOR_RES, LV_SIZE_CONTENT);\n"
+            "    lv_obj_set_style_radius(top_bar_, 0, 0);\n"
+            "    lv_obj_set_style_bg_opa(top_bar_, LV_OPA_50, 0);  // 50% opacity background",
+            "    top_bar_ = lv_obj_create(screen);\n"
+            "    lv_obj_set_size(top_bar_, LV_HOR_RES, LV_SIZE_CONTENT);\n"
+            "    lv_obj_set_style_radius(top_bar_, 0, 0);\n"
+            "    lv_obj_set_style_bg_opa(top_bar_, LV_OPA_TRANSP, 0);  // [miaomiao-bars-transparent] 原为 50%，全屏预览时成白块",
+        ),
+        (
+            "        lv_obj_set_style_bg_opa(top_bar_, LV_OPA_50, 0);",
+            "        lv_obj_set_style_bg_opa(top_bar_, LV_OPA_TRANSP, 0);  // [miaomiao-bars-transparent]",
+        ),
+        (
+            "    bottom_bar_ = lv_obj_create(screen);\n"
+            "    lv_obj_set_size(bottom_bar_, LV_HOR_RES, text_font->line_height + lvgl_theme->spacing(12));\n"
+            "    lv_obj_set_style_radius(bottom_bar_, 0, 0);\n"
+            "    lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);",
+            "    bottom_bar_ = lv_obj_create(screen);\n"
+            "    lv_obj_set_size(bottom_bar_, LV_HOR_RES, text_font->line_height + lvgl_theme->spacing(12));\n"
+            "    lv_obj_set_style_radius(bottom_bar_, 0, 0);\n"
+            "    lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);\n"
+            "    lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_TRANSP, 0);  // [miaomiao-bars-transparent] 预览时不挡照片",
+        ),
+        (
+            "        lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_50, 0);",
+            "        lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_TRANSP, 0);  // [miaomiao-bars-transparent]",
         ),
     ]
     for old, new in reps:
