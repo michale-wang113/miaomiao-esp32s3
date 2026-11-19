@@ -162,7 +162,7 @@
 #define BATTERY_ADC_ATTEN       ADC_ATTEN_DB_12
 // 分压比：实测 1324mV（充电中）→ ×3.0 ≈ 3.97V ≈ 满电附近，推断 1/3 分压
 #define BATTERY_VOLTAGE_RATIO   3.0f          // [推断 1/3 分压] 档位显示容错大，偏差一格可再校
-#define BATTERY_FULL_MV         4200
+#define BATTERY_FULL_MV         4000  // [实测校准] 浮充 3.97V≈满格；锂电 3.6-4.0V 集中 80% 电量区间
 #define BATTERY_EMPTY_MV        3300
 #define BATTERY_CRITICAL_PERCENT 5            // [已确认] 低于此值进 deep sleep
 
