@@ -538,6 +538,123 @@ def patch_idle_dashboard() -> None:
     print("[patch] 待机日期版补丁已应用（大时钟 + 日期，无天气无网络）")
 
 
+
+# ============================================================
+# [miaomiao-idle-battery] 待机电量显示：时钟下方电量标签
+# 复用 UpdateStatusBar 每 tick 的 board.GetBatteryLevel() 读数，
+# 同步到待机电量标签（+62px），文本变化才重绘，避免高频局部刷新
+# ============================================================
+
+def patch_idle_battery() -> None:
+    """待机电量标签（时钟下方 +62px，白字）：依赖 patch_idle_no_emoji 与
+    patch_idle_dashboard 先执行（锚点均为其插入文本）。
+    1) lvgl_display.h：加 idle_battery_label_ 成员；
+    2) lcd_display.cc：SetupUI 创建电量标签，待机进入显示、离开隐藏；
+    3) lvgl_display.cc：补 <cstdio>；UpdateStatusBar 电量块同步待机标签
+       （lv_label_get_text 比对，文本不变不触发重绘）。"""
+    lcd = root / "main" / "display" / "lcd_display.cc"
+    lv_h = root / "main" / "display" / "lvgl_display" / "lvgl_display.h"
+    lv_cc = root / "main" / "display" / "lvgl_display" / "lvgl_display.cc"
+    for p in [lcd, lv_h, lv_cc]:
+        if not p.exists():
+            print(f"[patch] 未找到 {p}，跳过待机电量补丁")
+            return
+    text_lcd = lcd.read_text(encoding="utf-8")
+    text_lh = lv_h.read_text(encoding="utf-8")
+    text_lcc = lv_cc.read_text(encoding="utf-8")
+    if "[miaomiao-idle-battery]" in text_lcc:
+        print("[patch] 待机电量补丁已应用，跳过")
+        return
+
+    reps_lh = [
+        (
+            "    lv_obj_t *idle_date_label_ = nullptr;   // [miaomiao-idle-date] 待机日期标签\n",
+            "    lv_obj_t *idle_date_label_ = nullptr;   // [miaomiao-idle-date] 待机日期标签\n"
+            "    lv_obj_t *idle_battery_label_ = nullptr;  // [miaomiao-idle-battery] 待机电量标签\n",
+        ),
+    ]
+
+    reps_lcd = [
+        # SetupUI：日期标签创建块后追加电量标签
+        (
+            "    lv_obj_align(idle_date_label_, LV_ALIGN_CENTER, 0, -62);\n"
+            "    lv_obj_add_flag(idle_date_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "\n"
+            "    /* Middle layer: preview_image_ - centered display */\n",
+            "    lv_obj_align(idle_date_label_, LV_ALIGN_CENTER, 0, -62);\n"
+            "    lv_obj_add_flag(idle_date_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "\n"
+            "    // [miaomiao-idle-battery] 待机电量标签（时钟下方弧区，白字，默认隐藏）\n"
+            "    idle_battery_label_ = lv_label_create(screen);\n"
+            "    lv_obj_set_style_text_font(idle_battery_label_, text_font, 0);\n"
+            "    lv_obj_set_style_text_color(idle_battery_label_, lv_color_white(), 0);\n"
+            '    lv_label_set_text(idle_battery_label_, "电量 --%");\n'
+            "    lv_obj_align(idle_battery_label_, LV_ALIGN_CENTER, 0, 62);\n"
+            "    lv_obj_add_flag(idle_battery_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "\n"
+            "    /* Middle layer: preview_image_ - centered display */\n",
+        ),
+        # 进入待机：显示电量标签（插在日期显示块之后、return 之前）
+        (
+            "            lv_obj_remove_flag(idle_date_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "            lv_obj_move_foreground(idle_date_label_);\n"
+            "        }\n"
+            "        return;\n",
+            "            lv_obj_remove_flag(idle_date_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "            lv_obj_move_foreground(idle_date_label_);\n"
+            "        }\n"
+            "        // [miaomiao-idle-battery] 进入待机：显示电量标签（文本由 UpdateStatusBar 填充）\n"
+            "        if (idle_battery_label_ != nullptr) {\n"
+            "            lv_obj_remove_flag(idle_battery_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "            lv_obj_move_foreground(idle_battery_label_);\n"
+            "        }\n"
+            "        return;\n",
+        ),
+        # 离开待机：隐藏电量标签（插在日期隐藏行之后）
+        (
+            "            if (idle_date_label_ != nullptr) lv_obj_add_flag(idle_date_label_, LV_OBJ_FLAG_HIDDEN);\n",
+            "            if (idle_date_label_ != nullptr) lv_obj_add_flag(idle_date_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "            if (idle_battery_label_ != nullptr) lv_obj_add_flag(idle_battery_label_, LV_OBJ_FLAG_HIDDEN);\n",
+        ),
+    ]
+
+    reps_lcc = [
+        # 注：snprintf 所需 <cstdio> 已由 patch_idle_dashboard 头部补丁引入，无需重复添加
+        # UpdateStatusBar 电量块：同步待机电量标签
+        (
+            "        DisplayLockGuard lock(this);\n"
+            "        if (battery_label_ != nullptr && battery_icon_ != icon) {\n"
+            "            battery_icon_ = icon;\n"
+            "            lv_label_set_text(battery_label_, battery_icon_);\n"
+            "        }\n",
+            "        DisplayLockGuard lock(this);\n"
+            "        if (battery_label_ != nullptr && battery_icon_ != icon) {\n"
+            "            battery_icon_ = icon;\n"
+            "            lv_label_set_text(battery_label_, battery_icon_);\n"
+            "        }\n"
+            "        // [miaomiao-idle-battery] 同步待机电量标签（文本变化才重绘，避免每秒局部刷新）\n"
+            "        if (idle_battery_label_ != nullptr) {\n"
+            "            char bat_str[24];\n"
+            '            snprintf(bat_str, sizeof(bat_str), "电量 %d%%", battery_level);\n'
+            "            const char* cur_bat = lv_label_get_text(idle_battery_label_);\n"
+            "            if (cur_bat == nullptr || strcmp(cur_bat, bat_str) != 0) {\n"
+            "                lv_label_set_text(idle_battery_label_, bat_str);\n"
+            "            }\n"
+            "        }\n",
+        ),
+    ]
+
+    for text, reps, p in [(text_lcd, reps_lcd, lcd), (text_lh, reps_lh, lv_h), (text_lcc, reps_lcc, lv_cc)]:
+        for old, new in reps:
+            n = text.count(old)
+            if n != 1:
+                print(f"[patch] ⚠️ 待机电量补丁锚点命中 {n} 次（期望 1），中止: {old[:60]!r}")
+                return
+            text = text.replace(old, new)
+        p.write_text(text, encoding="utf-8")
+    print("[patch] 待机电量补丁已应用（时钟下方 +62px，随状态栏每秒同步）")
+
+
 if __name__ == "__main__":
     ok = patch_kconfig()
     patch_cmake()
@@ -545,6 +662,7 @@ if __name__ == "__main__":
     patch_display_preview()
     patch_idle_no_emoji()
     patch_idle_dashboard()
+    patch_idle_battery()
     if not (root / "main" / "boards" / BOARD_DIR).exists():
         print(f"[patch] ⚠️ 尚未复制板目录: cp -r source/board/{BOARD_DIR} main/boards/{BOARD_DIR}")
     print("[patch] 完成。下一步: idf.py set-target esp32s3 && idf.py build")
