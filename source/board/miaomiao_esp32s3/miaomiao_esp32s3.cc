@@ -23,6 +23,8 @@
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
 #include <esp_adc/adc_oneshot.h>
+#include <esp_adc/adc_cali.h>
+#include <esp_adc/adc_cali_curve_fitting.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_gc9a01.h>
@@ -50,6 +52,11 @@ private:
     Display* display_ = nullptr;
     i2c_master_bus_handle_t codec_i2c_bus_ = nullptr;
     adc_oneshot_unit_handle_t battery_adc_handle_ = nullptr;
+    adc_cali_handle_t battery_cali_handle_ = nullptr;
+    static constexpr int kBatterySampleCount = 8;
+    int battery_mv_samples_[kBatterySampleCount] = {0};  // 滑动平均滤波（对齐原厂 filtered）
+    int battery_mv_idx_ = 0;
+    int battery_mv_count_ = 0;
 
     void InitializeCodecI2c() {
         // [已确认] codec 控制口 I2C0：SDA=GPIO1, SCL=GPIO2（JTAG 实测）
@@ -255,25 +262,43 @@ public:
     }
 
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
-        // [已确认] ADC 通道 3；GPIO 推断 GPIO14，分压比待实测校准
+        // [2026-11-19 修复] 对齐原厂 BatterygetVoltage()：ADC1_CH3 + curve_fitting 校准
+        // + 滑动平均滤波。此前 ADC2 与 WiFi 互斥、读取恒失败且未查返回值 → 电量恒 0%。
         if (battery_adc_handle_ == nullptr) {
             adc_oneshot_unit_init_cfg_t init_cfg = {};
-            init_cfg.unit_id = BATTERY_ADC_UNIT;
+            init_cfg.unit_id = ADC_UNIT_1;   // [已确认] 原厂用 ADC1（ADC2 被 WiFi 占用）
             ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg, &battery_adc_handle_));
             adc_oneshot_chan_cfg_t chan_cfg = {
                 .atten = BATTERY_ADC_ATTEN, .bitwidth = ADC_BITWIDTH_DEFAULT,
             };
             ESP_ERROR_CHECK(adc_oneshot_config_channel(
                 battery_adc_handle_, BATTERY_ADC_CHANNEL, &chan_cfg));
+            adc_cali_curve_fitting_config_t cali_cfg = {
+                .unit_id = ADC_UNIT_1,
+                .atten = BATTERY_ADC_ATTEN,
+                .bitwidth = ADC_BITWIDTH_DEFAULT,
+            };
+            ESP_ERROR_CHECK(adc_cali_create_scheme_curve_fitting(&cali_cfg, &battery_cali_handle_));
         }
-        int raw = 0;
-        adc_oneshot_read(battery_adc_handle_, BATTERY_ADC_CHANNEL, &raw);
-        int mv = static_cast<int>(raw * BATTERY_VOLTAGE_RATIO);   // 简化标定；精确值用 adc_cali
+        int raw = 0, mv = 0;
+        if (adc_oneshot_read(battery_adc_handle_, BATTERY_ADC_CHANNEL, &raw) != ESP_OK ||
+            adc_cali_raw_to_voltage(battery_cali_handle_, raw, &mv) != ESP_OK) {
+            ESP_LOGW(TAG, "Battery ADC read failed, skip update");
+            return false;   // 读取失败不上报，避免显示假电量
+        }
+        battery_mv_samples_[battery_mv_idx_++] = mv;
+        if (battery_mv_idx_ >= kBatterySampleCount) battery_mv_idx_ = 0;
+        if (battery_mv_count_ < kBatterySampleCount) battery_mv_count_++;
+        int64_t sum = 0;
+        for (int i = 0; i < battery_mv_count_; i++) sum += battery_mv_samples_[i];
+        int stable_mv = static_cast<int>(sum / battery_mv_count_);
+        int batt_mv = static_cast<int>(stable_mv * BATTERY_VOLTAGE_RATIO);   // 分压还原电池总电压
         charging = false;
-        discharging = false;
-        level = 100 * (mv - BATTERY_EMPTY_MV) / (BATTERY_FULL_MV - BATTERY_EMPTY_MV);
+        discharging = true;
+        level = 100 * (batt_mv - BATTERY_EMPTY_MV) / (BATTERY_FULL_MV - BATTERY_EMPTY_MV);
         if (level < 0) level = 0;
         if (level > 100) level = 100;
+        ESP_LOGI(TAG, "Battery pin=%dmV batt=%dmV level=%d%%", stable_mv, batt_mv, level);
         return true;
     }
 };

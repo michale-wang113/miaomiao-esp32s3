@@ -148,15 +148,17 @@
 // 按键与电池
 // [已确认] 2026-11-16 固件字符串 "Exit MAC address screen by button 43/44"
 //          + GPIO_IN1 实测 GPIO43/44 空闲均为高（上拉）→ 双按键 GPIO43/44
-// [已确认] 电池采样 ADC 通道 3；ADC1_CH3=GPIO4 已被 I2C1 占用，
-//          推断实际为 ADC2_CH3=GPIO14（全机唯一未分配引脚）—— 需实测校准
+// [2026-11-19 修正] 原厂 BatterygetVoltage() 固件二进制铁证：
+//          adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_3, ...) + adc_cali_raw_to_voltage
+//          → ADC1_CH3（GPIO4，与摄像头 SCCB SDA 复用 pad，原厂分时复用设计）。
+//          此前推断 ADC2_CH3=GPIO14 错误：ADC2 与 WiFi 互斥，读取恒失败 → 电量恒 0%。
 // -----------------------------------------------------------------------------
 #define BOOT_BUTTON_GPIO        GPIO_NUM_43   // [已确认] 按键1（长按显示 MAC）
 #define SECOND_BUTTON_GPIO      GPIO_NUM_44   // [已确认] 按键2
 
-#define BATTERY_ADC_CHANNEL     ADC_CHANNEL_3 // [已确认] 通道号
-#define BATTERY_ADC_GPIO        GPIO_NUM_14   // [高置信推断] ADC2_CH3，需实测
-#define BATTERY_ADC_UNIT        ADC_UNIT_2    // [推断] 与 GPIO14 对应
+#define BATTERY_ADC_CHANNEL     ADC_CHANNEL_3 // [已确认] 原厂通道 3
+#define BATTERY_ADC_GPIO        GPIO_NUM_4    // [已确认] ADC1_CH3=GPIO4（代码按通道寻址，此宏仅注释用途）
+#define BATTERY_ADC_UNIT        ADC_UNIT_1    // [已确认] 原厂用 ADC1；ADC2 与 WiFi 互斥读取恒失败
 #define BATTERY_ADC_ATTEN       ADC_ATTEN_DB_12
 // 分压比：锂电 4.2V 经 1/2 分压进 ADC（常见设计），实测校准
 #define BATTERY_VOLTAGE_RATIO   2.0f          // [待确认]

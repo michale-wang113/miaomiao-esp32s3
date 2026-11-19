@@ -549,7 +549,7 @@ def patch_idle_battery() -> None:
     """待机电量标签（时钟下方 +62px，白字）：依赖 patch_idle_no_emoji 与
     patch_idle_dashboard 先执行（锚点均为其插入文本）。
     1) lvgl_display.h：加 idle_battery_label_ 成员；
-    2) lcd_display.cc：SetupUI 创建电量标签，待机进入显示、离开隐藏；
+    2) lcd_display.cc：SetupUI 创建电池图标标签（icon_font，原厂同款），随待机显隐；
     3) lvgl_display.cc：补 <cstdio>；UpdateStatusBar 电量块同步待机标签
        （lv_label_get_text 比对，文本不变不触发重绘）。"""
     lcd = root / "main" / "display" / "lcd_display.cc"
@@ -584,11 +584,11 @@ def patch_idle_battery() -> None:
             "    lv_obj_align(idle_date_label_, LV_ALIGN_CENTER, 0, -62);\n"
             "    lv_obj_add_flag(idle_date_label_, LV_OBJ_FLAG_HIDDEN);\n"
             "\n"
-            "    // [miaomiao-idle-battery] 待机电量标签（时钟下方弧区，白字，默认隐藏）\n"
+            "    // [miaomiao-idle-battery] 待机电池图标（时钟下方弧区，原厂同款 5 档图标，默认隐藏）\n"
             "    idle_battery_label_ = lv_label_create(screen);\n"
-            "    lv_obj_set_style_text_font(idle_battery_label_, text_font, 0);\n"
+            "    lv_obj_set_style_text_font(idle_battery_label_, icon_font, 0);\n"
             "    lv_obj_set_style_text_color(idle_battery_label_, lv_color_white(), 0);\n"
-            '    lv_label_set_text(idle_battery_label_, "电量 --%");\n'
+            "    lv_label_set_text(idle_battery_label_, FONT_AWESOME_BATTERY_FULL);\n"
             "    lv_obj_align(idle_battery_label_, LV_ALIGN_CENTER, 0, 62);\n"
             "    lv_obj_add_flag(idle_battery_label_, LV_OBJ_FLAG_HIDDEN);\n"
             "\n"
@@ -632,13 +632,11 @@ def patch_idle_battery() -> None:
             "            battery_icon_ = icon;\n"
             "            lv_label_set_text(battery_label_, battery_icon_);\n"
             "        }\n"
-            "        // [miaomiao-idle-battery] 同步待机电量标签（文本变化才重绘，避免每秒局部刷新）\n"
+            "        // [miaomiao-idle-battery] 同步待机电池图标（原厂同款 5 档，档位变化才重绘）\n"
             "        if (idle_battery_label_ != nullptr) {\n"
-            "            char bat_str[24];\n"
-            '            snprintf(bat_str, sizeof(bat_str), "电量 %d%%", battery_level);\n'
             "            const char* cur_bat = lv_label_get_text(idle_battery_label_);\n"
-            "            if (cur_bat == nullptr || strcmp(cur_bat, bat_str) != 0) {\n"
-            "                lv_label_set_text(idle_battery_label_, bat_str);\n"
+            "            if (cur_bat == nullptr || strcmp(cur_bat, icon) != 0) {\n"
+            "                lv_label_set_text(idle_battery_label_, icon);\n"
             "            }\n"
             "        }\n",
         ),
@@ -652,7 +650,7 @@ def patch_idle_battery() -> None:
                 return
             text = text.replace(old, new)
         p.write_text(text, encoding="utf-8")
-    print("[patch] 待机电量补丁已应用（时钟下方 +62px，随状态栏每秒同步）")
+    print("[patch] 待机电池图标补丁已应用（原厂同款 5 档图标，时钟下方 +62px）")
 
 
 if __name__ == "__main__":
