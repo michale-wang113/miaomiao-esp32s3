@@ -246,56 +246,54 @@ def patch_display_preview() -> None:
     print("[patch] lcd_display.cc 预览图已改为全屏 cover 模式")
 
 
-def patch_display_text_redraw() -> None:
-    """文字更新后整屏重绘：状态文字/通知/聊天文字变化时，LVGL 对 MODIFIABLE GIF
-    画布做局部合成会输出白色块（闪现一帧，下一帧 GIF 全屏重绘才擦掉）。
-    现象：待机时每 10 秒时钟 "HH:MM" 更新一次就闪一次白框（2026-11-19 用户确认
-    "状态文字变化时出现"）。根因与 CI 用 lvgl 9.4.0 有关（vendor v2.2.2 为 9.2/9.3
-    时代版本，无此现象）。整屏重绘规避局部重绘路径，GIF 每帧本就全屏重绘，开销可忽略。
-    锚点已在 v2.2.2 上游源码上验证各命中 1 次。"""
-    targets = [
-        root / "main" / "display" / "lvgl_display" / "lvgl_display.cc",
-        root / "main" / "display" / "lcd_display.cc",
-    ]
-    for p in targets:
-        if not p.exists():
-            print(f"[patch] 未找到 {p.name}，跳过整屏重绘补丁")
-            return
-    lcd_lv = targets[0].read_text(encoding="utf-8")
-    lcd = targets[1].read_text(encoding="utf-8")
-    if "[miaomiao-full-redraw]" in lcd_lv:
-        print("[patch] 整屏重绘补丁已应用，跳过")
+def patch_idle_no_emoji() -> None:
+    """待机时不显示眼睛动画（与 vendor 原厂行为一致）：
+    vendor 待机 = 黑底 + 时间/电量，唤醒后才显示眼睛。我们的固件待机时播放
+    neutral 眨眼 GIF，而 LVGL 9.4 对"文字局部重绘落在 GIF 画布上"的合成有缺陷
+    ——待机时钟每 10 秒更新一次就在文字周围闪一帧白块/白屏。待机隐藏表情区后
+    不再有 GIF 画布，该路径被彻底绕开；唤醒后（listening/speaking 等状态）
+    SetEmotion("neutral") 照常恢复眼睛动画。
+    同时撤下旧"整屏重绘"补丁思路（CI 每次从上游干净克隆，无需回滚代码）。"""
+    app = root / "main" / "application.cc"
+    lcd = root / "main" / "display" / "lcd_display.cc"
+    if not app.exists() or not lcd.exists():
+        print("[patch] 未找到 application.cc / lcd_display.cc，跳过待机无表情补丁")
         return
-    note = ("// [miaomiao-full-redraw] 局部重绘在 LVGL 9.4 下对 GIF 画布合成会闪白块，"
-            "整屏重绘规避\n    lv_obj_invalidate(lv_screen_active());")
-    reps_lv = [
+    text_app = app.read_text(encoding="utf-8")
+    text_lcd = lcd.read_text(encoding="utf-8")
+    if "[miaomiao-idle-no-emoji]" in text_app:
+        print("[patch] 待机无表情补丁已应用，跳过")
+        return
+    reps_app = [
         (
-            "    last_status_update_time_ = std::chrono::system_clock::now();\n}",
-            "    last_status_update_time_ = std::chrono::system_clock::now();\n"
-            "    " + note + "\n}",
-        ),
-        (
-            "    ESP_ERROR_CHECK(esp_timer_start_once(notification_timer_, duration_ms * 1000));\n}",
-            "    ESP_ERROR_CHECK(esp_timer_start_once(notification_timer_, duration_ms * 1000));\n"
-            "    " + note + "\n}",
+            'display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)',
+            'display->SetEmotion("none"); // [miaomiao-idle-no-emoji] 待机不显示眼睛动画（vendor 行为），'
+            "避免 GIF 画布局部重绘闪白",
         ),
     ]
     reps_lcd = [
         (
-            "    lv_label_set_text(chat_message_label_, content);\n}",
-            "    lv_label_set_text(chat_message_label_, content);\n"
-            "    " + note + "\n}",
+            "    auto emoji_collection = static_cast<LvglTheme*>(current_theme_)->emoji_collection();",
+            "    // [miaomiao-idle-no-emoji] emotion \"none\"：隐藏表情区（待机黑底，只留状态栏时间/电量）\n"
+            '    if (strcmp(emotion, "none") == 0) {\n'
+            "        DisplayLockGuard lock(this);\n"
+            "        lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);\n"
+            "        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "        return;\n"
+            "    }\n"
+            "\n"
+            "    auto emoji_collection = static_cast<LvglTheme*>(current_theme_)->emoji_collection();",
         ),
     ]
-    for text, reps, p in [(lcd_lv, reps_lv, targets[0]), (lcd, reps_lcd, targets[1])]:
+    for text, reps, p in [(text_app, reps_app, app), (text_lcd, reps_lcd, lcd)]:
         for old, new in reps:
             n = text.count(old)
             if n != 1:
-                print(f"[patch] ⚠️ 整屏重绘补丁锚点命中 {n} 次（期望 1），中止: {old[:60]!r}")
+                print(f"[patch] ⚠️ 待机无表情补丁锚点命中 {n} 次（期望 1），中止: {old[:60]!r}")
                 return
             text = text.replace(old, new)
         p.write_text(text, encoding="utf-8")
-    print("[patch] 文字更新整屏重绘补丁已应用（SetStatus/ShowNotification/SetChatMessage）")
+    print("[patch] 待机无表情补丁已应用（idle → SetEmotion(\"none\") 隐藏眼睛）")
 
 
 if __name__ == "__main__":
@@ -303,7 +301,7 @@ if __name__ == "__main__":
     patch_cmake()
     write_sdkconfig_defaults()
     patch_display_preview()
-    patch_display_text_redraw()
+    patch_idle_no_emoji()
     if not (root / "main" / "boards" / BOARD_DIR).exists():
         print(f"[patch] ⚠️ 尚未复制板目录: cp -r source/board/{BOARD_DIR} main/boards/{BOARD_DIR}")
     print("[patch] 完成。下一步: idf.py set-target esp32s3 && idf.py build")
