@@ -261,11 +261,12 @@ public:
     }
 
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
-        // [2026-11-19 修复] 对齐原厂 BatterygetVoltage()：ADC1_CH3 + curve_fitting 校准
-        // + 滑动平均滤波。此前 ADC2 与 WiFi 互斥、读取恒失败且未查返回值 → 电量恒 0%。
+        // [2026-11-19 实测定版] 电池分压引脚 = GPIO14（ADC2_CH3），实测 1324mV 稳定。
+        // 0% 真正根因 = 旧代码把 ADC 码值×2 当 mV（3100mV<3300 空电阈值）。现用
+        // adc_cali 校准 + 滑动平均 + 实测分压比 1/3（BATTERY_VOLTAGE_RATIO=3.0）。
         if (battery_adc_handle_ == nullptr) {
             adc_oneshot_unit_init_cfg_t init_cfg = {};
-            init_cfg.unit_id = ADC_UNIT_1;   // [已确认] 原厂用 ADC1（ADC2 被 WiFi 占用）
+            init_cfg.unit_id = ADC_UNIT_2;   // [实测确认] GPIO14=ADC2_CH3，读数 1324mV 稳定
             ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg, &battery_adc_handle_));
             adc_oneshot_chan_cfg_t chan_cfg = {
                 .atten = BATTERY_ADC_ATTEN, .bitwidth = ADC_BITWIDTH_DEFAULT,
@@ -273,7 +274,7 @@ public:
             ESP_ERROR_CHECK(adc_oneshot_config_channel(
                 battery_adc_handle_, BATTERY_ADC_CHANNEL, &chan_cfg));
             adc_cali_curve_fitting_config_t cali_cfg = {
-                .unit_id = ADC_UNIT_1,
+                .unit_id = ADC_UNIT_2,
                 .atten = BATTERY_ADC_ATTEN,
                 .bitwidth = ADC_BITWIDTH_DEFAULT,
             };
@@ -297,30 +298,6 @@ public:
         level = 100 * (batt_mv - BATTERY_EMPTY_MV) / (BATTERY_FULL_MV - BATTERY_EMPTY_MV);
         if (level < 0) level = 0;
         if (level > 100) level = 100;
-        // [诊断] 并行探测 ADC2_CH3(GPIO14)：确认 vendor 真实电量通道与 ADC2/WiFi 互斥状态
-        {
-            static bool adc2_ready = false;
-            static adc_oneshot_unit_handle_t adc2_handle = nullptr;
-            static adc_cali_handle_t adc2_cali = nullptr;
-            if (!adc2_ready) {
-                adc_oneshot_unit_init_cfg_t i2 = {};
-                i2.unit_id = ADC_UNIT_2;
-                if (adc_oneshot_new_unit(&i2, &adc2_handle) == ESP_OK) {
-                    adc_oneshot_chan_cfg_t c2 = { .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT };
-                    adc_oneshot_config_channel(adc2_handle, ADC_CHANNEL_3, &c2);
-                    adc_cali_curve_fitting_config_t cc2 = {
-                        .unit_id = ADC_UNIT_2, .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT };
-                    if (adc_cali_create_scheme_curve_fitting(&cc2, &adc2_cali) != ESP_OK) adc2_cali = nullptr;
-                    adc2_ready = true;
-                }
-            }
-            int raw2 = 0, mv2 = -1;
-            esp_err_t r2 = adc2_ready ? adc_oneshot_read(adc2_handle, ADC_CHANNEL_3, &raw2)
-                                      : ESP_ERR_INVALID_STATE;
-            if (r2 == ESP_OK && adc2_cali != nullptr) adc_cali_raw_to_voltage(adc2_cali, raw2, &mv2);
-            ESP_LOGI(TAG, "BatteryDiag ADC2_CH3(G14): ret=%s raw=%d mv=%d",
-                     esp_err_to_name(r2), raw2, mv2);
-        }
         ESP_LOGI(TAG, "Battery pin=%dmV batt=%dmV level=%d%%", stable_mv, batt_mv, level);
         return true;
     }

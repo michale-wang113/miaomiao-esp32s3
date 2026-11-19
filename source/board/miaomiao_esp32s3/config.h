@@ -157,11 +157,11 @@
 #define SECOND_BUTTON_GPIO      GPIO_NUM_44   // [已确认] 按键2
 
 #define BATTERY_ADC_CHANNEL     ADC_CHANNEL_3 // [已确认] 原厂通道 3
-#define BATTERY_ADC_GPIO        GPIO_NUM_4    // [已确认] ADC1_CH3=GPIO4（代码按通道寻址，此宏仅注释用途）
-#define BATTERY_ADC_UNIT        ADC_UNIT_1    // [已确认] 原厂用 ADC1；ADC2 与 WiFi 互斥读取恒失败
+#define BATTERY_ADC_GPIO        GPIO_NUM_14   // [实测确认] 1324mV 稳定读数（ADC2_CH3）
+#define BATTERY_ADC_UNIT        ADC_UNIT_2    // [实测确认] WiFi 环境下读取 ESP_OK，无互斥问题
 #define BATTERY_ADC_ATTEN       ADC_ATTEN_DB_12
-// 分压比：锂电 4.2V 经 1/2 分压进 ADC（常见设计），实测校准
-#define BATTERY_VOLTAGE_RATIO   2.0f          // [待确认]
+// 分压比：实测 1324mV（充电中）→ ×3.0 ≈ 3.97V ≈ 满电附近，推断 1/3 分压
+#define BATTERY_VOLTAGE_RATIO   3.0f          // [推断 1/3 分压] 档位显示容错大，偏差一格可再校
 #define BATTERY_FULL_MV         4200
 #define BATTERY_EMPTY_MV        3300
 #define BATTERY_CRITICAL_PERCENT 5            // [已确认] 低于此值进 deep sleep
