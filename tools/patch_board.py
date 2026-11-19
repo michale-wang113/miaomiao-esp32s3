@@ -387,12 +387,449 @@ def patch_idle_no_emoji() -> None:
     print("[patch] 待机模式补丁已应用（无眼睛 + 黑底白字 + 居中大时钟）")
 
 
+
+# ============================================================
+# [miaomiao-weather] 待机组合表盘：日期 + 大时钟 + 天气
+# ============================================================
+
+WEATHER_SERVICE_H = r"""#ifndef WEATHER_SERVICE_H
+#define WEATHER_SERVICE_H
+
+#include <string>
+
+#include "display.h"
+
+// [miaomiao-weather] 待机天气服务：IP 自动定位 + Open-Meteo 当前天气
+// 30 分钟刷新一次；失败自动退避重试，不影响设备其他功能
+class WeatherService {
+public:
+    static WeatherService& GetInstance();
+
+    void Start(Display* display);
+
+private:
+    WeatherService() = default;
+
+    static void TaskEntry(void* arg);
+    void Run();
+    bool FetchLocation(double& lat, double& lon);
+    bool FetchWeather(double lat, double lon, std::string& out);
+
+    Display* display_ = nullptr;
+};
+
+#endif  // WEATHER_SERVICE_H
+"""
+
+WEATHER_SERVICE_CC = r"""#include "weather/weather_service.h"
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <esp_log.h>
+#include <esp_http_client.h>
+#include <esp_crt_bundle.h>
+#include <cJSON.h>
+
+#include <cstring>
+#include <cstdio>
+
+#define WEATHER_TAG "MiaoWeather"
+
+namespace {
+
+// [miaomiao-weather] WMO 天气码 → 中文短语（字体字符集已验证全部包含）
+const char* DescribeWeather(int code) {
+    if (code == 0 || code == 1) return "晴";
+    if (code == 2) return "多云";
+    if (code == 3) return "阴";
+    if (code == 45 || code == 48) return "雾";
+    if (code >= 51 && code <= 57) return "小雨";
+    if (code == 61 || code == 80) return "小雨";
+    if (code == 63 || code == 81) return "中雨";
+    if (code == 65 || code == 82) return "大雨";
+    if (code == 66 || code == 67) return "冻雨";
+    if (code >= 71 && code <= 77) return "雪";
+    if (code == 85 || code == 86) return "阵雪";
+    if (code >= 95) return "雷雨";
+    return "多云";
+}
+
+std::string HttpGet(const char* url, bool use_crt_bundle) {
+    esp_http_client_config_t cfg = {};
+    cfg.url = url;
+    cfg.timeout_ms = 10000;
+    cfg.buffer_size = 4096;
+    if (use_crt_bundle) {
+        cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    }
+    std::string body;
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (client == nullptr) {
+        return body;
+    }
+    if (esp_http_client_open(client, 0) == ESP_OK) {
+        int content_len = esp_http_client_fetch_headers(client);
+        if (content_len >= 0) {
+            char buf[512];
+            int read_len = 0;
+            while ((read_len = esp_http_client_read(client, buf, sizeof(buf))) > 0) {
+                body.append(buf, read_len);
+                if (body.size() > 16384) {
+                    break;  // 防御性上限
+                }
+            }
+        }
+        esp_http_client_close(client);
+    }
+    esp_http_client_cleanup(client);
+    return body;
+}
+
+}  // namespace
+
+WeatherService& WeatherService::GetInstance() {
+    static WeatherService instance;
+    return instance;
+}
+
+void WeatherService::Start(Display* display) {
+    if (display == nullptr) {
+        return;
+    }
+    display_ = display;
+    xTaskCreate(TaskEntry, "MiaoWeather", 6144, this, 2, nullptr);
+    ESP_LOGI(WEATHER_TAG, "天气服务已启动");
+}
+
+void WeatherService::TaskEntry(void* arg) {
+    static_cast<WeatherService*>(arg)->Run();
+    vTaskDelete(nullptr);
+}
+
+void WeatherService::Run() {
+    double lat = 0.0;
+    double lon = 0.0;
+    bool have_location = false;
+    while (true) {
+        if (!have_location) {
+            have_location = FetchLocation(lat, lon);
+            if (!have_location) {
+                // 网络未就绪/定位失败：60 秒后重试
+                vTaskDelay(pdMS_TO_TICKS(60 * 1000));
+                continue;
+            }
+        }
+        std::string text;
+        if (FetchWeather(lat, lon, text)) {
+            display_->SetWeather(text.c_str());
+            // 成功：30 分钟刷新
+            vTaskDelay(pdMS_TO_TICKS(30 * 60 * 1000));
+        } else {
+            // 失败：5 分钟重试
+            vTaskDelay(pdMS_TO_TICKS(5 * 60 * 1000));
+        }
+    }
+}
+
+bool WeatherService::FetchLocation(double& lat, double& lon) {
+    std::string body = HttpGet("http://ip-api.com/json/?fields=status,lat,lon", false);
+    if (body.empty()) {
+        return false;
+    }
+    cJSON* root = cJSON_Parse(body.c_str());
+    if (root == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    cJSON* status = cJSON_GetObjectItem(root, "status");
+    cJSON* jlat = cJSON_GetObjectItem(root, "lat");
+    cJSON* jlon = cJSON_GetObjectItem(root, "lon");
+    if (status != nullptr && status->valuestring != nullptr &&
+            strcmp(status->valuestring, "success") == 0 &&
+            cJSON_IsNumber(jlat) && cJSON_IsNumber(jlon)) {
+        lat = jlat->valuedouble;
+        lon = jlon->valuedouble;
+        ok = true;
+        ESP_LOGI(WEATHER_TAG, "IP 定位成功: %.2f, %.2f", lat, lon);
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+
+bool WeatherService::FetchWeather(double lat, double lon, std::string& out) {
+    char url[256];
+    snprintf(url, sizeof(url),
+             "https://api.open-meteo.com/v1/forecast"
+             "?latitude=%.4f&longitude=%.4f&current=temperature_2m,weather_code"
+             "&forecast_days=1&timezone=auto",
+             lat, lon);
+    std::string body = HttpGet(url, true);
+    if (body.empty()) {
+        return false;
+    }
+    cJSON* root = cJSON_Parse(body.c_str());
+    if (root == nullptr) {
+        return false;
+    }
+    cJSON* current = cJSON_GetObjectItem(root, "current");
+    cJSON* temp = current ? cJSON_GetObjectItem(current, "temperature_2m") : nullptr;
+    cJSON* code = current ? cJSON_GetObjectItem(current, "weather_code") : nullptr;
+    bool ok = false;
+    if (cJSON_IsNumber(temp) && cJSON_IsNumber(code)) {
+        int t = static_cast<int>(temp->valuedouble + (temp->valuedouble >= 0 ? 0.5 : -0.5));
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%s %d°", DescribeWeather(code->valueint), t);
+        out = buf;
+        ok = true;
+        ESP_LOGI(WEATHER_TAG, "天气更新: %s", out.c_str());
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+"""
+
+
+def write_weather_service() -> None:
+    """把天气服务模块写入 main/weather/（CMake 由 patch_weather_sources 收集）。"""
+    wdir = root / "main" / "weather"
+    wdir.mkdir(parents=True, exist_ok=True)
+    (wdir / "weather_service.h").write_text(WEATHER_SERVICE_H, encoding="utf-8")
+    (wdir / "weather_service.cc").write_text(WEATHER_SERVICE_CC, encoding="utf-8")
+    print("[patch] 已写入 main/weather/weather_service.{h,cc}")
+
+
+def patch_weather_sources() -> None:
+    """main/CMakeLists.txt：登记 weather_service.cc 源文件 + 网络组件依赖。"""
+    cmake = root / "main" / "CMakeLists.txt"
+    if not cmake.exists():
+        print("[patch] 未找到 main/CMakeLists.txt，跳过 weather 源登记")
+        return
+    text = cmake.read_text(encoding="utf-8")
+    if '"weather/weather_service.cc"' in text:
+        print("[patch] CMakeLists 已含 weather_service，跳过")
+        return
+    reps = [
+        (
+            '            "display/lvgl_display/lvgl_image.cc"\n',
+            '            "display/lvgl_display/lvgl_image.cc"\n'
+            '            "weather/weather_service.cc"\n',
+        ),
+        (
+            "                    PRIV_REQUIRES\n"
+            "                        esp_pm\n",
+            "                    PRIV_REQUIRES\n"
+            "                        esp_pm\n"
+            "                        esp_http_client\n"
+            "                        json\n"
+            "                        mbedtls\n",
+        ),
+    ]
+    for old, new in reps:
+        n = text.count(old)
+        if n != 1:
+            print(f"[patch] ⚠️ weather 源登记锚点命中 {n} 次（期望 1），中止: {old[:60]!r}")
+            return
+        text = text.replace(old, new)
+    cmake.write_text(text, encoding="utf-8")
+    print("[patch] CMakeLists 已登记 weather_service.cc + esp_http_client/json/mbedtls")
+
+
+def patch_idle_dashboard() -> None:
+    """待机组合表盘：日期（时钟上方）+ 大时钟（居中）+ 天气（时钟下方）。
+    两块 GC9A01 并联共用 CS/DC（硬件镜像），无法各自显示不同内容，
+    因此两屏同步显示同一组合表盘。依赖 patch_idle_no_emoji 先执行。
+    1) display.h：Display 基类加 SetWeather 虚函数（默认无操作）；
+    2) lvgl_display.h：加 idle_date_label_/idle_weather_label_ 成员与 SetWeather 声明；
+    3) lcd_display.cc：SetupUI 创建两个标签（时钟上 -62 / 下 +62，白字），待机分支
+       进入时填日期并显示两标签、离开时隐藏；
+    4) lvgl_display.cc：SetStatus 时间同步时顺带刷新日期；实现 SetWeather。
+    锚点均为前一补丁插入文本或上游源码唯一行。"""
+    disp_h = root / "main" / "display" / "display.h"
+    lcd = root / "main" / "display" / "lcd_display.cc"
+    lv_h = root / "main" / "display" / "lvgl_display" / "lvgl_display.h"
+    lv_cc = root / "main" / "display" / "lvgl_display" / "lvgl_display.cc"
+    for p in [disp_h, lcd, lv_h, lv_cc]:
+        if not p.exists():
+            print(f"[patch] 未找到 {p}，跳过待机表盘补丁")
+            return
+    text_dh = disp_h.read_text(encoding="utf-8")
+    text_lcd = lcd.read_text(encoding="utf-8")
+    text_lh = lv_h.read_text(encoding="utf-8")
+    text_lcc = lv_cc.read_text(encoding="utf-8")
+    if "[miaomiao-weather]" in text_lcd:
+        print("[patch] 待机表盘补丁已应用，跳过")
+        return
+
+    reps_dh = [
+        (
+            "    virtual void SetStatus(const char* status);\n"
+            "    virtual void ShowNotification(const char* notification, int duration_ms = 3000);\n",
+            "    virtual void SetStatus(const char* status);\n"
+            "    virtual void SetWeather(const char* weather) {}  "
+            "// [miaomiao-weather] 默认无操作；有天气标签的显示层覆写\n"
+            "    virtual void ShowNotification(const char* notification, int duration_ms = 3000);\n",
+        ),
+    ]
+
+    reps_lh = [
+        (
+            "    virtual void SetStatus(const char* status);\n",
+            "    virtual void SetStatus(const char* status);\n"
+            "    virtual void SetWeather(const char* weather);  // [miaomiao-weather] 更新待机天气标签\n",
+        ),
+        (
+            "    lv_obj_t *idle_clock_label_ = nullptr;  // [miaomiao-idle-clock] 待机居中大时钟\n",
+            "    lv_obj_t *idle_clock_label_ = nullptr;  // [miaomiao-idle-clock] 待机居中大时钟\n"
+            "    lv_obj_t *idle_date_label_ = nullptr;   // [miaomiao-weather] 待机日期标签\n"
+            "    lv_obj_t *idle_weather_label_ = nullptr;  // [miaomiao-weather] 待机天气标签\n",
+        ),
+    ]
+
+    date_fill_block = (
+        "        if (idle_date_label_ != nullptr) {\n"
+        "            time_t now_d = time(NULL);\n"
+        "            struct tm* tm_d = localtime(&now_d);\n"
+        '            static const char* kWeekday[] = {"日", "一", "二", "三", "四", "五", "六"};\n'
+        "            char date_str[24];\n"
+        "            if (tm_d->tm_year >= 2025 - 1900) {\n"
+        '                snprintf(date_str, sizeof(date_str), "%d月%d日 周%s",\n'
+        "                         tm_d->tm_mon + 1, tm_d->tm_mday, kWeekday[tm_d->tm_wday]);\n"
+        "                lv_label_set_text(idle_date_label_, date_str);\n"
+        "            } else {\n"
+        '                lv_label_set_text(idle_date_label_, "--月--日");\n'
+        "            }\n"
+        "            lv_obj_remove_flag(idle_date_label_, LV_OBJ_FLAG_HIDDEN);\n"
+        "            lv_obj_move_foreground(idle_date_label_);\n"
+        "        }\n"
+    )
+
+    reps_lcd = [
+        # 头部补 cstdio（snprintf）
+        (
+            "#include <cstring>\n"
+            "#include <ctime>\n",
+            "#include <cstring>\n"
+            "#include <ctime>\n"
+            "#include <cstdio>\n",
+        ),
+        # SetupUI：时钟创建块后追加日期/天气标签
+        (
+            "    lv_obj_add_flag(idle_clock_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "\n"
+            "    /* Middle layer: preview_image_ - centered display */\n",
+            "    lv_obj_add_flag(idle_clock_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "\n"
+            "    // [miaomiao-weather] 待机日期/天气标签（时钟上/下弧区，白字，默认隐藏）\n"
+            "    idle_date_label_ = lv_label_create(screen);\n"
+            "    lv_obj_set_style_text_font(idle_date_label_, text_font, 0);\n"
+            "    lv_obj_set_style_text_color(idle_date_label_, lv_color_white(), 0);\n"
+            '    lv_label_set_text(idle_date_label_, "");\n'
+            "    lv_obj_align(idle_date_label_, LV_ALIGN_CENTER, 0, -62);\n"
+            "    lv_obj_add_flag(idle_date_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "\n"
+            "    idle_weather_label_ = lv_label_create(screen);\n"
+            "    lv_obj_set_style_text_font(idle_weather_label_, text_font, 0);\n"
+            "    lv_obj_set_style_text_color(idle_weather_label_, lv_color_white(), 0);\n"
+            '    lv_label_set_text(idle_weather_label_, "");\n'
+            "    lv_obj_align(idle_weather_label_, LV_ALIGN_CENTER, 0, 62);\n"
+            "    lv_obj_add_flag(idle_weather_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "\n"
+            "    /* Middle layer: preview_image_ - centered display */\n",
+        ),
+        # 待机 "none" 分支：填充日期 + 显示两个标签
+        (
+            "            lv_obj_remove_flag(idle_clock_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "            lv_obj_move_foreground(idle_clock_label_);\n"
+            "        }\n"
+            "        return;\n",
+            "            lv_obj_remove_flag(idle_clock_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "            lv_obj_move_foreground(idle_clock_label_);\n"
+            "        }\n"
+            "        // [miaomiao-weather] 进入待机：立即填充日期并显示天气标签\n"
+            + date_fill_block +
+            "        if (idle_weather_label_ != nullptr) {\n"
+            "            lv_obj_remove_flag(idle_weather_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "            lv_obj_move_foreground(idle_weather_label_);\n"
+            "        }\n"
+            "        return;\n",
+        ),
+        # 离开待机：隐藏两个标签
+        (
+            "            lv_obj_add_flag(idle_clock_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "            lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);\n",
+            "            lv_obj_add_flag(idle_clock_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "            if (idle_date_label_ != nullptr) lv_obj_add_flag(idle_date_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "            if (idle_weather_label_ != nullptr) lv_obj_add_flag(idle_weather_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "            lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);\n",
+        ),
+    ]
+
+    reps_lcc = [
+        # 头部补 ctime/cstdio
+        (
+            "#include <cstdlib>\n",
+            "#include <cstdlib>\n"
+            "#include <ctime>\n"
+            "#include <cstdio>\n",
+        ),
+        # SetStatus 时间同步时顺带刷新日期
+        (
+            "        && strlen(status) >= 4 && strlen(status) <= 5 && strchr(status, ':') != nullptr) {\n"
+            "        lv_label_set_text(idle_clock_label_, status);\n"
+            "    }\n",
+            "        && strlen(status) >= 4 && strlen(status) <= 5 && strchr(status, ':') != nullptr) {\n"
+            "        lv_label_set_text(idle_clock_label_, status);\n"
+            "        // [miaomiao-weather] 顺带刷新待机日期（每 10 秒，代价可忽略）\n"
+            "        if (idle_date_label_ != nullptr) {\n"
+            "            time_t now_s = time(NULL);\n"
+            "            struct tm* tm_s = localtime(&now_s);\n"
+            '            static const char* kWeekday[] = {"日", "一", "二", "三", "四", "五", "六"};\n'
+            "            char date_str[24];\n"
+            "            if (tm_s->tm_year >= 2025 - 1900) {\n"
+            '                snprintf(date_str, sizeof(date_str), "%d月%d日 周%s",\n'
+            "                         tm_s->tm_mon + 1, tm_s->tm_mday, kWeekday[tm_s->tm_wday]);\n"
+            "                lv_label_set_text(idle_date_label_, date_str);\n"
+            "            }\n"
+            "        }\n"
+            "    }\n",
+        ),
+        # SetWeather 实现（插在 UpdateStatusBar 定义前）
+        (
+            "void LvglDisplay::UpdateStatusBar(bool update_all) {\n",
+            "// [miaomiao-weather] 更新待机天气标签（非待机时仅缓存文本，进入待机自动显示）\n"
+            "void LvglDisplay::SetWeather(const char* weather) {\n"
+            "    if (idle_weather_label_ == nullptr) {\n"
+            "        return;\n"
+            "    }\n"
+            "    DisplayLockGuard lock(this);\n"
+            "    lv_label_set_text(idle_weather_label_, weather);\n"
+            "}\n"
+            "\n"
+            "void LvglDisplay::UpdateStatusBar(bool update_all) {\n",
+        ),
+    ]
+
+    for text, reps, p in [(text_dh, reps_dh, disp_h), (text_lcd, reps_lcd, lcd),
+                          (text_lh, reps_lh, lv_h), (text_lcc, reps_lcc, lv_cc)]:
+        for old, new in reps:
+            n = text.count(old)
+            if n != 1:
+                print(f"[patch] ⚠️ 待机表盘补丁锚点命中 {n} 次（期望 1），中止: {old[:60]!r}")
+                return
+            text = text.replace(old, new)
+        p.write_text(text, encoding="utf-8")
+    print("[patch] 待机组合表盘补丁已应用（日期 + 大时钟 + 天气）")
+
+
 if __name__ == "__main__":
     ok = patch_kconfig()
     patch_cmake()
     write_sdkconfig_defaults()
     patch_display_preview()
     patch_idle_no_emoji()
+    write_weather_service()
+    patch_weather_sources()
+    patch_idle_dashboard()
     if not (root / "main" / "boards" / BOARD_DIR).exists():
         print(f"[patch] ⚠️ 尚未复制板目录: cp -r source/board/{BOARD_DIR} main/boards/{BOARD_DIR}")
     print("[patch] 完成。下一步: idf.py set-target esp32s3 && idf.py build")

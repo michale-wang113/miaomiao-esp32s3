@@ -35,6 +35,7 @@
 #include "config.h"
 #include "esp32_camera.h"
 #include "mcp_server.h"
+#include "weather/weather_service.h"
 
 #include "servo_controller.h"
 
@@ -166,6 +167,8 @@ private:
         // McpServer::AddTool 仅登记工具表，实际启动在协议层之后，构造期注册安全
         RegisterServoTools();
         RegisterDisplayTools();
+        // [miaomiao-weather] 启动待机天气服务（IP 定位 + Open-Meteo，独立任务自动重试）
+        WeatherService::GetInstance().Start(GetDisplay());
     }
 
     std::string MacAddressString() {
