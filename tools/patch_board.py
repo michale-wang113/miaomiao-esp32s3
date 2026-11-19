@@ -246,11 +246,64 @@ def patch_display_preview() -> None:
     print("[patch] lcd_display.cc 预览图已改为全屏 cover 模式")
 
 
+def patch_display_text_redraw() -> None:
+    """文字更新后整屏重绘：状态文字/通知/聊天文字变化时，LVGL 对 MODIFIABLE GIF
+    画布做局部合成会输出白色块（闪现一帧，下一帧 GIF 全屏重绘才擦掉）。
+    现象：待机时每 10 秒时钟 "HH:MM" 更新一次就闪一次白框（2026-11-19 用户确认
+    "状态文字变化时出现"）。根因与 CI 用 lvgl 9.4.0 有关（vendor v2.2.2 为 9.2/9.3
+    时代版本，无此现象）。整屏重绘规避局部重绘路径，GIF 每帧本就全屏重绘，开销可忽略。
+    锚点已在 v2.2.2 上游源码上验证各命中 1 次。"""
+    targets = [
+        root / "main" / "display" / "lvgl_display" / "lvgl_display.cc",
+        root / "main" / "display" / "lcd_display.cc",
+    ]
+    for p in targets:
+        if not p.exists():
+            print(f"[patch] 未找到 {p.name}，跳过整屏重绘补丁")
+            return
+    lcd_lv = targets[0].read_text(encoding="utf-8")
+    lcd = targets[1].read_text(encoding="utf-8")
+    if "[miaomiao-full-redraw]" in lcd_lv:
+        print("[patch] 整屏重绘补丁已应用，跳过")
+        return
+    note = ("// [miaomiao-full-redraw] 局部重绘在 LVGL 9.4 下对 GIF 画布合成会闪白块，"
+            "整屏重绘规避\n    lv_obj_invalidate(lv_screen_active());")
+    reps_lv = [
+        (
+            "    last_status_update_time_ = std::chrono::system_clock::now();\n}",
+            "    last_status_update_time_ = std::chrono::system_clock::now();\n"
+            "    " + note + "\n}",
+        ),
+        (
+            "    ESP_ERROR_CHECK(esp_timer_start_once(notification_timer_, duration_ms * 1000));\n}",
+            "    ESP_ERROR_CHECK(esp_timer_start_once(notification_timer_, duration_ms * 1000));\n"
+            "    " + note + "\n}",
+        ),
+    ]
+    reps_lcd = [
+        (
+            "    lv_label_set_text(chat_message_label_, content);\n}",
+            "    lv_label_set_text(chat_message_label_, content);\n"
+            "    " + note + "\n}",
+        ),
+    ]
+    for text, reps, p in [(lcd_lv, reps_lv, targets[0]), (lcd, reps_lcd, targets[1])]:
+        for old, new in reps:
+            n = text.count(old)
+            if n != 1:
+                print(f"[patch] ⚠️ 整屏重绘补丁锚点命中 {n} 次（期望 1），中止: {old[:60]!r}")
+                return
+            text = text.replace(old, new)
+        p.write_text(text, encoding="utf-8")
+    print("[patch] 文字更新整屏重绘补丁已应用（SetStatus/ShowNotification/SetChatMessage）")
+
+
 if __name__ == "__main__":
     ok = patch_kconfig()
     patch_cmake()
     write_sdkconfig_defaults()
     patch_display_preview()
+    patch_display_text_redraw()
     if not (root / "main" / "boards" / BOARD_DIR).exists():
         print(f"[patch] ⚠️ 尚未复制板目录: cp -r source/board/{BOARD_DIR} main/boards/{BOARD_DIR}")
     print("[patch] 完成。下一步: idf.py set-target esp32s3 && idf.py build")
