@@ -80,6 +80,9 @@ def write_sdkconfig_defaults() -> None:
     # 避免内部 RAM 不足导致 cam_dma_config "frames malloc failed"（vendor 构建同款行为）
     if "CONFIG_CAMERA_PSRAM_DMA" not in lines:
         lines.append("CONFIG_CAMERA_PSRAM_DMA=y")
+    # 待机居中大时钟需要的 LVGL 内置大号数字字体
+    if "CONFIG_LV_FONT_MONTSERRAT_48" not in lines:
+        lines.append("CONFIG_LV_FONT_MONTSERRAT_48=y")
     defaults.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("[patch] sdkconfig.defaults 已写入默认板型 + CAMERA_PSRAM_DMA")
 
@@ -247,53 +250,141 @@ def patch_display_preview() -> None:
 
 
 def patch_idle_no_emoji() -> None:
-    """待机时不显示眼睛动画（与 vendor 原厂行为一致）：
-    vendor 待机 = 黑底 + 时间/电量，唤醒后才显示眼睛。我们的固件待机时播放
-    neutral 眨眼 GIF，而 LVGL 9.4 对"文字局部重绘落在 GIF 画布上"的合成有缺陷
-    ——待机时钟每 10 秒更新一次就在文字周围闪一帧白块/白屏。待机隐藏表情区后
-    不再有 GIF 画布，该路径被彻底绕开；唤醒后（listening/speaking 等状态）
-    SetEmotion("neutral") 照常恢复眼睛动画。
-    同时撤下旧"整屏重绘"补丁思路（CI 每次从上游干净克隆，无需回滚代码）。"""
+    """待机模式对齐 vendor 并美化：黑底白字 + 居中大时钟。
+    1) application.cc idle 分支 SetEmotion("neutral")→("none")，待机不播眼睛动画
+       （LVGL 9.4 对"文字局部重绘落在 GIF 画布上"的合成有缺陷，待机时钟每 10 秒
+       更新就闪白屏；vendor 待机无眼睛所以从不触发）。
+    2) lcd_display.cc SetEmotion 增加 "none" 处理：隐藏眼睛/状态栏，背景改纯黑，
+       显示居中 montserrat_48 大时钟（sdkconfig 启用 CONFIG_LV_FONT_MONTSERRAT_48）；
+       离开待机时隐藏时钟、恢复状态栏并 SetTheme(current_theme_) 还原主题背景。
+    3) lvgl_display.h 增加 idle_clock_label_ 成员（两个 TU 共用）。
+    4) lvgl_display.cc SetStatus 把 "HH:MM" 形态文本同步到居中大时钟。
+    锚点已对 v2.2.2 上游源码验证各命中 1 次。"""
     app = root / "main" / "application.cc"
     lcd = root / "main" / "display" / "lcd_display.cc"
-    if not app.exists() or not lcd.exists():
-        print("[patch] 未找到 application.cc / lcd_display.cc，跳过待机无表情补丁")
-        return
+    lcd_h = root / "main" / "display" / "lvgl_display" / "lvgl_display.h"
+    lvgl_cc = root / "main" / "display" / "lvgl_display" / "lvgl_display.cc"
+    for p in [app, lcd, lcd_h, lvgl_cc]:
+        if not p.exists():
+            print(f"[patch] 未找到 {p.name}，跳过待机无表情补丁")
+            return
     text_app = app.read_text(encoding="utf-8")
     text_lcd = lcd.read_text(encoding="utf-8")
-    if "[miaomiao-idle-no-emoji]" in text_app:
+    text_lh = lcd_h.read_text(encoding="utf-8")
+    text_lcc = lvgl_cc.read_text(encoding="utf-8")
+    if "[miaomiao-idle-clock]" in text_app:
         print("[patch] 待机无表情补丁已应用，跳过")
         return
+
     reps_app = [
         (
             'display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)',
-            'display->SetEmotion("none"); // [miaomiao-idle-no-emoji] 待机不显示眼睛动画（vendor 行为），'
+            'display->SetEmotion("none"); // [miaomiao-idle-clock] 待机不显示眼睛动画（vendor 行为），'
             "避免 GIF 画布局部重绘闪白",
         ),
     ]
+
     reps_lcd = [
+        # 文件头：声明 montserrat_48 大字体
+        (
+            "#include <cstring>\n",
+            "#include <cstring>\n"
+            "#include <ctime>\n"
+            "LV_FONT_DECLARE(lv_font_montserrat_48);  // [miaomiao-idle-clock] 待机大时钟字体（sdkconfig 启用）\n",
+        ),
+        # SetupUI：创建居中大时钟（放在 preview_image_ 之前，emoji_box_ 之后）
+        (
+            "    /* Middle layer: preview_image_ - centered display */\n",
+            "    // [miaomiao-idle-clock] 待机大时钟（居中白字，默认隐藏）\n"
+            "    idle_clock_label_ = lv_label_create(screen);\n"
+            "    lv_obj_set_style_text_font(idle_clock_label_, &lv_font_montserrat_48, 0);\n"
+            "    lv_obj_set_style_text_color(idle_clock_label_, lv_color_white(), 0);\n"
+            '    lv_label_set_text(idle_clock_label_, "");\n'
+            "    lv_obj_align(idle_clock_label_, LV_ALIGN_CENTER, 0, 0);\n"
+            "    lv_obj_add_flag(idle_clock_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "\n"
+            "    /* Middle layer: preview_image_ - centered display */\n",
+        ),
+        # SetEmotion："none" 待机模式 + 离开待机恢复
         (
             "    auto emoji_collection = static_cast<LvglTheme*>(current_theme_)->emoji_collection();",
-            "    // [miaomiao-idle-no-emoji] emotion \"none\"：隐藏表情区（待机黑底，只留状态栏时间/电量）\n"
+            "    // [miaomiao-idle-clock] emotion \"none\"：待机模式——黑底白字，隐藏眼睛/状态栏，居中大时钟\n"
             '    if (strcmp(emotion, "none") == 0) {\n'
             "        DisplayLockGuard lock(this);\n"
             "        lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);\n"
             "        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "        lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);\n"
+            "        lv_obj_set_style_bg_color(container_, lv_color_black(), 0);\n"
+            "        lv_obj_set_style_bg_opa(container_, LV_OPA_COVER, 0);\n"
+            "        if (network_label_ != nullptr) lv_obj_set_style_text_color(network_label_, lv_color_white(), 0);\n"
+            "        if (mute_label_ != nullptr) lv_obj_set_style_text_color(mute_label_, lv_color_white(), 0);\n"
+            "        if (battery_label_ != nullptr) lv_obj_set_style_text_color(battery_label_, lv_color_white(), 0);\n"
+            "        if (idle_clock_label_ != nullptr) {\n"
+            "            // 立即填充当前时间，不用等 10 秒周期刷新\n"
+            "            time_t now = time(NULL);\n"
+            "            struct tm* tm = localtime(&now);\n"
+            "            char time_str[16];\n"
+            "            if (tm->tm_year >= 2025 - 1900 && strftime(time_str, sizeof(time_str), \"%H:%M\", tm)) {\n"
+            "                lv_label_set_text(idle_clock_label_, time_str);\n"
+            "            } else {\n"
+            '                lv_label_set_text(idle_clock_label_, "--:--");\n'
+            "            }\n"
+            "            lv_obj_remove_flag(idle_clock_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "            lv_obj_move_foreground(idle_clock_label_);\n"
+            "        }\n"
             "        return;\n"
+            "    }\n"
+            "\n"
+            "    // [miaomiao-idle-clock] 离开待机：隐藏大时钟、恢复状态栏与主题背景\n"
+            "    if (idle_clock_label_ != nullptr && !lv_obj_has_flag(idle_clock_label_, LV_OBJ_FLAG_HIDDEN)) {\n"
+            "        {\n"
+            "            DisplayLockGuard lock(this);\n"
+            "            lv_obj_add_flag(idle_clock_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "            lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);\n"
+            "        }\n"
+            "        SetTheme(current_theme_);\n"
             "    }\n"
             "\n"
             "    auto emoji_collection = static_cast<LvglTheme*>(current_theme_)->emoji_collection();",
         ),
     ]
-    for text, reps, p in [(text_app, reps_app, app), (text_lcd, reps_lcd, lcd)]:
+
+    reps_lh = [
+        (
+            "    lv_obj_t *battery_label_ = nullptr;\n",
+            "    lv_obj_t *battery_label_ = nullptr;\n"
+            "    lv_obj_t *idle_clock_label_ = nullptr;  // [miaomiao-idle-clock] 待机居中大时钟\n",
+        ),
+    ]
+
+    reps_lcc = [
+        # SetStatus：把 "HH:MM" 同步到待机大时钟
+        (
+            "    lv_label_set_text(status_label_, status);\n"
+            "    lv_obj_remove_flag(status_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "    lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);\n",
+            "    lv_label_set_text(status_label_, status);\n"
+            "    lv_obj_remove_flag(status_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "    lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);\n"
+            "\n"
+            "    // [miaomiao-idle-clock] 待机时把时间同步到居中大时钟（仅同步 \"H:MM\"/\"HH:MM\" 形态文本）\n"
+            "    if (idle_clock_label_ != nullptr && !lv_obj_has_flag(idle_clock_label_, LV_OBJ_FLAG_HIDDEN)\n"
+            "        && strlen(status) >= 4 && strlen(status) <= 5 && strchr(status, ':') != nullptr) {\n"
+            "        lv_label_set_text(idle_clock_label_, status);\n"
+            "    }\n",
+        ),
+    ]
+
+    for text, reps, p in [(text_app, reps_app, app), (text_lcd, reps_lcd, lcd),
+                          (text_lh, reps_lh, lcd_h), (text_lcc, reps_lcc, lvgl_cc)]:
         for old, new in reps:
             n = text.count(old)
             if n != 1:
-                print(f"[patch] ⚠️ 待机无表情补丁锚点命中 {n} 次（期望 1），中止: {old[:60]!r}")
+                print(f"[patch] ⚠️ 待机补丁锚点命中 {n} 次（期望 1），中止: {old[:60]!r}")
                 return
             text = text.replace(old, new)
         p.write_text(text, encoding="utf-8")
-    print("[patch] 待机无表情补丁已应用（idle → SetEmotion(\"none\") 隐藏眼睛）")
+    print("[patch] 待机模式补丁已应用（无眼睛 + 黑底白字 + 居中大时钟）")
 
 
 if __name__ == "__main__":
