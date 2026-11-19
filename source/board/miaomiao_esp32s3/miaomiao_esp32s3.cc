@@ -24,7 +24,6 @@
 #include <driver/spi_master.h>
 #include <esp_adc/adc_oneshot.h>
 #include <esp_adc/adc_cali.h>
-#include <esp_adc/adc_cali_curve_fitting.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_gc9a01.h>
