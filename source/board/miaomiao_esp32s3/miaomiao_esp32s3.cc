@@ -297,6 +297,30 @@ public:
         level = 100 * (batt_mv - BATTERY_EMPTY_MV) / (BATTERY_FULL_MV - BATTERY_EMPTY_MV);
         if (level < 0) level = 0;
         if (level > 100) level = 100;
+        // [诊断] 并行探测 ADC2_CH3(GPIO14)：确认 vendor 真实电量通道与 ADC2/WiFi 互斥状态
+        {
+            static bool adc2_ready = false;
+            static adc_oneshot_unit_handle_t adc2_handle = nullptr;
+            static adc_cali_handle_t adc2_cali = nullptr;
+            if (!adc2_ready) {
+                adc_oneshot_unit_init_cfg_t i2 = {};
+                i2.unit_id = ADC_UNIT_2;
+                if (adc_oneshot_new_unit(&i2, &adc2_handle) == ESP_OK) {
+                    adc_oneshot_chan_cfg_t c2 = { .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT };
+                    adc_oneshot_config_channel(adc2_handle, ADC_CHANNEL_3, &c2);
+                    adc_cali_curve_fitting_config_t cc2 = {
+                        .unit_id = ADC_UNIT_2, .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT };
+                    if (adc_cali_create_scheme_curve_fitting(&cc2, &adc2_cali) != ESP_OK) adc2_cali = nullptr;
+                    adc2_ready = true;
+                }
+            }
+            int raw2 = 0, mv2 = -1;
+            esp_err_t r2 = adc2_ready ? adc_oneshot_read(adc2_handle, ADC_CHANNEL_3, &raw2)
+                                      : ESP_ERR_INVALID_STATE;
+            if (r2 == ESP_OK && adc2_cali != nullptr) adc_cali_raw_to_voltage(adc2_cali, raw2, &mv2);
+            ESP_LOGI(TAG, "BatteryDiag ADC2_CH3(G14): ret=%s raw=%d mv=%d",
+                     esp_err_to_name(r2), raw2, mv2);
+        }
         ESP_LOGI(TAG, "Battery pin=%dmV batt=%dmV level=%d%%", stable_mv, batt_mv, level);
         return true;
     }
